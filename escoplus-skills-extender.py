@@ -1425,7 +1425,7 @@ def jobs_link_prediction(
 @forecast_router.get("/courses")
 def courses_link_prediction(
     keywords: str = Query(..., description="Comma-separated keywords (e.g. data, ai, green)"),
-    source: str = Query("coursera", description="Source of the courses"),
+    source: str = Query(None, description="Optional source filter (e.g. Udacity, europass)"),
     similarity_threshold: float = Query(0.7, description="Minimum similarity to consider edges"),
     top_k: int = Query(30, description="Number of top predicted links to return"),
     method: str = Query("adamic_adar", description="Link prediction method: adamic_adar, resource_allocation, or jaccard")
