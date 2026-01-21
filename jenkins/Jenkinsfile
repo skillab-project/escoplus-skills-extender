@@ -35,7 +35,8 @@ pipeline {
         // ******************
         stage("Run Unit Tests") {
             steps {
-                echo "***** ToDo.. Run Unit Tests in Docker *****"
+                echo "***** Run Unit Tests in Docker *****"
+                sh "docker compose run --rm escoplus-skills-extender python -m pytest tests/"
             }
         }
 

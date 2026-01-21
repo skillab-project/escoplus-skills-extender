@@ -6,3 +6,7 @@ scikit-learn
 numpy
 python-dotenv
 networkx
+
+pytest>=7.0.0
+httpx>=0.24.0
+pytest-mock>=3.10.0
