@@ -36,7 +36,17 @@ pipeline {
         stage("Run Unit Tests") {
             steps {
                 echo "***** Run Unit Tests in Docker *****"
-                sh "docker compose run --rm escoplus-skills-extender python -m pytest tests/"
+                sh "docker compose run --rm escoplus-skills-extender python -m pytest tests/unit/"
+            }
+        }
+
+        // ********************************
+        // *** INTEGRATION TESTS ***
+        // ********************************
+        stage("Run Integration Tests") {
+            steps {
+                echo "***** Run Integration Tests *****"
+                sh "docker compose run --rm role-classification python -m pytest tests/integration/"
             }
         }
 
