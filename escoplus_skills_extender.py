@@ -1,53 +1,494 @@
-from fastapi import FastAPI, APIRouter
-# === FILE: esco_extension_service.py ===
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, APIRouter, Query
+from fastapi.responses import StreamingResponse
+from pathlib import Path
+from typing import Optional
+import json, math, re, time, os, requests
+import numpy as np
 
 
-app = FastAPI(title="SKILLAB ESCOPlus Skills Extender API",
-              root_path="/escoplus-skills-extender")
+class _NumpyEncoder(json.JSONEncoder):
+    """Converts numpy int64/float64/bool_ to native Python types for JSON serialization."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
-# Create sub-routers
+
+def _safe_json_dumps(obj) -> str:
+    return json.dumps(obj, cls=_NumpyEncoder, ensure_ascii=False, indent=4)
+
+
+def _sanitize(obj):
+    """Recursively convert numpy scalars to native Python types."""
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+import pandas as pd
+import networkx as nx
+from dotenv import load_dotenv
+from collections import defaultdict
+from itertools import combinations
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import traceback
+
+# ============================================================
+#  LOAD & VALIDATE ENVIRONMENT
+# ============================================================
+load_dotenv()
+
+_REQUIRED_ENV = ["TRACKER_API", "TRACKER_USERNAME", "TRACKER_PASSWORD", "KU_API_URL"]
+_missing = [k for k in _REQUIRED_ENV if not os.getenv(k)]
+if _missing:
+    raise RuntimeError(
+        f"❌ Missing required environment variables: {_missing}\n"
+        f"   Make sure your .env file contains all of: {_REQUIRED_ENV}"
+    )
+
+print("✅ Environment loaded:")
+print(f"   TRACKER_API  = {os.getenv('TRACKER_API')}")
+print(f"   TRACKER_USERNAME = {os.getenv('TRACKER_USERNAME')}")
+print(f"   TRACKER_PASSWORD = {'*' * len(os.getenv('TRACKER_PASSWORD', ''))}")
+print(f"   KU_API_URL   = {os.getenv('KU_API_URL')}")
+
+app = FastAPI(title="SKILLAB ESCOPlus Skills Extender API")
+
 analysis_router = APIRouter(prefix="/api/analysis", tags=["Analysis"])
 forecast_router = APIRouter(prefix="/api/forecasting", tags=["Forecasting"])
 
-# === ANALYSIS ENDPOINTS ===
+
+# ============================================================
+#  SHARED HELPERS
+# ============================================================
+
+def _get_token() -> str:
+    """Authenticate and return a fresh Bearer token. Reads all values from .env."""
+    api_url = os.getenv("TRACKER_API")
+    res = requests.post(
+        f"{api_url}/login",
+        json={"username": os.getenv("TRACKER_USERNAME"), "password": os.getenv("TRACKER_PASSWORD")},
+        timeout=15
+    )
+    res.raise_for_status()
+    return res.text.replace('"', "")
+
+
+def _ensure_cache_folder() -> Path:
+    folder = Path("Completed_Analyses")
+    if not folder.exists():
+        folder.mkdir(parents=True)
+        print(f"📁 Folder '{folder}' created.")
+    else:
+        print(f"📁 Folder '{folder}' already exists.")
+    return folder
+
+
+def _batch_resolve_skills(headers: dict, unique_uris: list) -> dict:
+    """Resolve only the URIs actually found in the data — 50 per batch. Reads API URL from env."""
+    api_url = os.getenv("TRACKER_API")
+    id_to_label = {}
+    if not unique_uris:
+        return id_to_label
+    batch_size = 50
+    total_batches = math.ceil(len(unique_uris) / batch_size)
+    print(f"📚 Resolving {len(unique_uris)} unique skill URIs in {total_batches} batches...")
+    for batch_num, start in enumerate(range(0, len(unique_uris), batch_size), 1):
+        batch = unique_uris[start:start + batch_size]
+        skill_payload = [("ids", sid) for sid in batch]
+        try:
+            r = requests.post(f"{api_url}/skills", headers=headers, data=skill_payload, timeout=60)
+            r.raise_for_status()
+            for s in r.json().get("items", []):
+                sid = s.get("id", "")
+                if sid:
+                    id_to_label[sid] = s.get("label", sid).strip().lower()
+            print(f"   Batch {batch_num}/{total_batches}: resolved so far: {len(id_to_label)}")
+        except Exception as e:
+            print(f"   ⚠️ Batch {batch_num} failed: {e}")
+    matched = sum(1 for u in unique_uris if u in id_to_label)
+    print(f"🔗 Matched: {matched}/{len(unique_uris)} URIs")
+    return id_to_label
+
+
+def _auto_paginate(endpoint: str, headers: dict, form_builder_fn,
+                   page_size: int = 100, timeout: int = 180,
+                   max_retries: int = 3, backoff: int = 10) -> tuple:
+    """
+    Probe page 1 to get total count, then fetch all pages with retry.
+    Returns (items_list, total_count).
+    """
+    def fetch_page(page_num):
+        url = f"{os.getenv('TRACKER_API')}/{endpoint}?page={page_num}&page_size={page_size}"
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"   ↪ Attempt {attempt}/{max_retries} for page {page_num}...")
+                r = requests.post(url, headers=headers, data=form_builder_fn(), timeout=timeout)
+                if r.status_code != 200:
+                    print(f"   ⚠️ HTTP {r.status_code}: {r.text[:200]}")
+                    return {}
+                return r.json()
+            except requests.exceptions.ReadTimeout:
+                print(f"   ⏱️ Timeout page {page_num}, attempt {attempt}.")
+                if attempt < max_retries:
+                    time.sleep(backoff)
+                else:
+                    return {}
+            except Exception as ex:
+                print(f"   ❌ {type(ex).__name__}: {ex}")
+                return {}
+
+    print(f"🔍 Probing page 1 of /{endpoint}...")
+    probe = fetch_page(1)
+    if not probe:
+        return [], 0
+
+    total_count = probe.get("count", 0)
+    total_pages = math.ceil(total_count / page_size) if total_count > 0 else 1
+    print(f"📊 Total: {total_count} records → {total_pages} page(s)")
+
+    all_items = list(probe.get("items", []))
+    print(f"📦 Page 1/{total_pages}: {len(all_items)} items")
+
+    for page in range(2, total_pages + 1):
+        print(f"📄 Fetching page {page}/{total_pages}...")
+        data = fetch_page(page)
+        if not data:
+            print(f"⚠️ Page {page} failed — stopping early.")
+            break
+        items = data.get("items", [])
+        print(f"📦 Page {page}/{total_pages}: {len(items)} items (running total: {len(all_items) + len(items)})")
+        if not items:
+            break
+        all_items.extend(items)
+        if len(items) < page_size:
+            print("✅ Last page reached.")
+            break
+
+    print(f"🎯 Retrieved: {len(all_items)} / {total_count}")
+    return all_items, total_count
+
+
+AI_SKILLS_EXTENDED = [
+    # === Foundational AI/ML ===
+    "machine learning", "deep learning", "neural networks", "artificial intelligence",
+    "supervised learning", "unsupervised learning", "reinforcement learning",
+    "semi-supervised learning", "self-supervised learning", "transfer learning",
+    "few-shot learning", "zero-shot learning", "meta-learning", "federated learning",
+    "continual learning", "online learning", "active learning", "curriculum learning",
+    # === Large Language Models & Generative AI ===
+    "large language models", "llm", "gpt", "gpt-4", "gpt-4o", "claude", "gemini",
+    "llama", "mistral", "falcon", "phi", "qwen", "chatgpt", "openai api",
+    "prompt engineering", "prompt tuning", "instruction tuning", "rlhf",
+    "retrieval augmented generation", "rag", "chain of thought", "few-shot prompting",
+    "agentic ai", "ai agents", "autonomous agents", "multi-agent systems",
+    "langchain", "langgraph", "llamaindex", "autogen", "crewai",
+    "vector databases", "embedding models", "sentence transformers",
+    "semantic search", "hybrid search",
+    # === Model Architectures ===
+    "transformers", "attention mechanisms", "bert", "roberta", "t5", "gpt-2",
+    "convolutional neural networks", "cnn", "recurrent neural networks", "rnn",
+    "lstm", "gru", "graph neural networks", "gnn", "diffusion models",
+    "variational autoencoders", "vae", "generative adversarial networks", "gan",
+    "stable diffusion", "dall-e", "midjourney", "controlnet",
+    "mixture of experts", "moe", "sparse transformers", "state space models",
+    # === MLOps & Infrastructure ===
+    "mlops", "model deployment", "model serving", "model monitoring",
+    "model versioning", "experiment tracking", "mlflow", "weights & biases",
+    "kubeflow", "airflow", "feature stores", "data pipelines for ml",
+    "model compression", "quantization", "pruning", "knowledge distillation",
+    "onnx", "tensorrt", "triton inference server", "bentoml", "ray serve",
+    # === AI Frameworks ===
+    "pytorch", "tensorflow", "keras", "jax", "hugging face", "transformers library",
+    "scikit-learn", "xgboost", "lightgbm", "catboost", "fastai",
+    "opencv", "spacy", "nltk", "gensim", "detectron2",
+    # === NLP ===
+    "natural language processing", "nlp", "text classification", "named entity recognition",
+    "sentiment analysis", "text summarization", "machine translation",
+    "question answering", "information extraction", "coreference resolution",
+    "dependency parsing", "pos tagging", "tokenization", "word embeddings",
+    "word2vec", "glove", "fasttext", "text generation", "dialogue systems",
+    "natural language understanding", "natural language generation",
+    # === Computer Vision ===
+    "computer vision", "object detection", "image segmentation", "image classification",
+    "image generation", "video analysis", "pose estimation", "optical character recognition",
+    "ocr", "face recognition", "depth estimation", "3d reconstruction",
+    "point cloud processing", "medical image analysis", "satellite image analysis",
+    # === Data Science & Analytics ===
+    "data science", "data analysis", "exploratory data analysis", "feature engineering",
+    "feature selection", "dimensionality reduction", "pca", "t-sne", "umap",
+    "clustering", "k-means", "dbscan", "hierarchical clustering",
+    "anomaly detection", "time series forecasting", "causal inference",
+    "bayesian inference", "probabilistic programming", "statistical modelling",
+    # === AI Ethics & Safety ===
+    "ai ethics", "responsible ai", "ai safety", "ai alignment", "bias detection",
+    "fairness in ml", "explainable ai", "xai", "interpretable ml",
+    "shap", "lime", "counterfactual explanations", "model cards",
+    "ai governance", "ai regulation", "gdpr compliance for ai",
+    # === Emerging AI ===
+    "multimodal ai", "vision language models", "vlm", "gpt-4 vision",
+    "speech recognition", "text to speech", "audio generation",
+    "music generation", "code generation", "ai for code", "github copilot",
+    "ai pair programming", "neuro-symbolic ai", "quantum machine learning",
+    "ai for drug discovery", "ai for genomics", "digital twins ai",
+    "ai in robotics", "embodied ai", "world models",
+]
+
+GREEN_SKILLS_EXTENDED = [
+    # === Core Sustainability ===
+    "sustainability", "sustainable development", "circular economy", "green economy",
+    "environmental management", "ecological footprint", "carbon footprint",
+    "life cycle assessment", "lca", "environmental impact assessment",
+    "sustainability reporting", "esg reporting", "gri standards",
+    "sustainable finance", "green bonds", "impact investing",
+    # === Climate & Energy ===
+    "climate change mitigation", "climate change adaptation", "net zero",
+    "carbon neutrality", "carbon offsetting", "carbon capture",
+    "greenhouse gas emissions", "scope 1 2 3 emissions", "emissions trading",
+    "renewable energy", "solar energy", "wind energy", "offshore wind",
+    "hydropower", "geothermal energy", "tidal energy", "biomass energy",
+    "energy storage", "battery technology", "hydrogen energy", "green hydrogen",
+    "energy efficiency", "building energy efficiency", "smart grids",
+    "demand response", "power purchase agreements", "ppa",
+    # === Circular Economy & Waste ===
+    "waste management", "recycling", "upcycling", "material recovery",
+    "industrial symbiosis", "product lifecycle management",
+    "eco-design", "design for disassembly", "cradle to cradle",
+    "plastic reduction", "zero waste", "composting", "bioeconomy",
+    # === Biodiversity & Land Use ===
+    "biodiversity conservation", "ecosystem services", "nature-based solutions",
+    "reforestation", "afforestation", "sustainable land management",
+    "soil health", "regenerative agriculture", "agroecology",
+    "precision agriculture", "sustainable farming", "organic farming",
+    "water management", "water conservation", "watershed management",
+    "marine conservation", "blue economy",
+    # === Green Building & Cities ===
+    "green building", "leed certification", "breeam", "passive house",
+    "sustainable urban planning", "smart cities sustainability",
+    "urban heat island mitigation", "green infrastructure",
+    "sustainable transport", "electric vehicles", "ev charging infrastructure",
+    "public transport decarbonisation", "cycling infrastructure",
+    # === Supply Chain & Industry ===
+    "sustainable supply chain", "green procurement", "sustainable sourcing",
+    "corporate social responsibility", "csr", "supplier sustainability audits",
+    "low carbon manufacturing", "industrial decarbonisation",
+    "carbon border adjustment", "sustainable logistics",
+    "environmental product declaration", "epd",
+    # === Policy & Standards ===
+    "eu green deal", "taxonomy regulation", "sfdr", "csrd",
+    "paris agreement", "sdgs", "sustainable development goals",
+    "environmental compliance", "iso 14001", "iso 50001",
+    "science based targets", "sbti", "task force on climate disclosures", "tcfd",
+    # === Green Data & Tech ===
+    "green it", "sustainable computing", "energy efficient algorithms",
+    "ai for sustainability", "climate data analysis", "carbon accounting software",
+    "environmental monitoring systems", "remote sensing for environment",
+    "iot for environmental monitoring", "digital sustainability",
+]
+
+
+def _load_non_esco_skills() -> tuple:
+    """
+    Load non-ESCO skills from THREE sources and return merged list + source map.
+    Sources:
+      1. Technology Skills CSV
+      2. AI_SKILLS_EXTENDED (hardcoded)
+      3. GREEN_SKILLS_EXTENDED (hardcoded)
+    Returns:
+      all_skills: sorted deduplicated list of all non-ESCO skill strings
+      skill_source: dict mapping skill_string -> source label
+    """
+    skill_source = {}
+
+    # 1. CSV
+    csv_path = r"C:\Users\USER\PycharmProjects\pythonProject_pdf_parser\Technology Skills(Technology Skills) (1).csv"
+    csv_skills = []
+    try:
+        tech_df = pd.read_csv(csv_path, sep=None, engine='python', on_bad_lines='skip')
+        if "Example" not in tech_df.columns:
+            print("⚠️ CSV missing 'Example' column — skipping CSV source.")
+        else:
+            for row in tech_df["Example"].dropna().astype(str):
+                for s in row.replace(";", ",").split(","):
+                    s = s.strip().lower()
+                    if s:
+                        csv_skills.append(s)
+            print(f"📄 CSV: loaded {len(set(csv_skills))} technology skills.")
+    except Exception as e:
+        print(f"⚠️ Could not load CSV ({e}) — continuing without it.")
+
+    for s in set(csv_skills):
+        skill_source[s] = "technology_csv"
+
+    # 2. AI skills
+    for s in AI_SKILLS_EXTENDED:
+        s = s.strip().lower()
+        if s not in skill_source:
+            skill_source[s] = "ai_extended"
+        # if already from CSV, keep CSV label but note it's also AI
+    print(f"🤖 AI extended: {len(AI_SKILLS_EXTENDED)} skills.")
+
+    # 3. Green skills
+    for s in GREEN_SKILLS_EXTENDED:
+        s = s.strip().lower()
+        if s not in skill_source:
+            skill_source[s] = "green_extended"
+    print(f"🌿 Green extended: {len(GREEN_SKILLS_EXTENDED)} skills.")
+
+    all_skills = sorted(skill_source.keys())
+    print(f"✅ Total non-ESCO skill pool: {len(all_skills)} unique skills (CSV + AI + Green).")
+    return all_skills, skill_source
+
+
+def _load_tech_csv() -> list:
+    """Backwards-compatible wrapper — returns merged skill list only."""
+    skills, _ = _load_non_esco_skills()
+    return skills
+
+
+def _compute_similarity(esco_labels: list, non_esco_skills: list,
+                         similarity_threshold: float, confidence_threshold: float,
+                         freq_map: dict, skill_source: dict = None) -> tuple:
+    """
+    TF-IDF cosine similarity + confidence. Returns (matches, high_conf_skills).
+    Each match is tagged with its source: technology_csv | ai_extended | green_extended.
+    """
+    from collections import Counter as _Counter
+    print(f"🔍 TF-IDF similarity: {len(esco_labels)} ESCO x {len(non_esco_skills)} non-ESCO skills...")
+    corpus = esco_labels + non_esco_skills
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4))
+    tfidf = vec.fit_transform(corpus)
+    sim = cosine_similarity(tfidf[:len(esco_labels)], tfidf[len(esco_labels):])
+
+    matches = []
+    for i, esco_skill in enumerate(esco_labels):
+        j = int(np.argmax(sim[i]))
+        sc = float(sim[i][j])
+        if sc >= similarity_threshold:
+            matched_skill = non_esco_skills[j]
+            source = (skill_source or {}).get(matched_skill, "technology_csv")
+            matches.append({
+                "ESCO_skill": esco_skill,
+                "non_ESCO_skill": matched_skill,
+                "similarity": round(sc, 3),
+                "source": source,
+            })
+
+    for m in matches:
+        f = freq_map.get(m["ESCO_skill"], 1)
+        m["confidence"] = round(float(m["similarity"] * (1 + np.log1p(f) / 10)), 3)
+
+    high_conf = [m for m in matches if m["confidence"] >= confidence_threshold]
+    src_counts = dict(_Counter(m["source"] for m in high_conf))
+    print(f"✅ {len(matches)} matches -> {len(high_conf)} high-confidence | by source: {src_counts}")
+    return matches, high_conf
+
+
+def _build_network(high_conf_skills: list) -> tuple:
+    """Build NetworkX graph and compute metrics. Returns (G, nodes, edges, stats)."""
+    G = nx.Graph()
+    for m in high_conf_skills:
+        e, n = m["ESCO_skill"], m["non_ESCO_skill"]
+        G.add_node(e, group="ESCO_skill")
+        G.add_node(n, group="non_ESCO_skill")
+        G.add_edge(e, n, similarity=m["similarity"], confidence=m["confidence"])
+
+    if G.number_of_edges() > 0:
+        raw_degree = {k: int(v) for k, v in dict(G.degree()).items()}
+        degree_centrality = {k: round(float(v), 3) for k, v in nx.degree_centrality(G).items()}
+        avg_similarity = float(np.mean([d["similarity"] for _, _, d in G.edges(data=True)]))
+        clustering = round(float(nx.average_clustering(G)), 3)
+        components = [len(c) for c in nx.connected_components(G)]
+        largest_component = int(max(components))
+    else:
+        raw_degree = degree_centrality = {}
+        avg_similarity = clustering = largest_component = 0
+
+    nodes = [{"id": str(n), "group": G.nodes[n]["group"],
+               "degree": int(raw_degree.get(n, 0)),
+               "degree_centrality": float(degree_centrality.get(n, 0))} for n in G.nodes()]
+    edges = [{"source": str(u), "target": str(v),
+               "similarity": float(d.get("similarity", 0)),
+               "confidence": float(d.get("confidence", 0))} for u, v, d in G.edges(data=True)]
+
+    esco_deg = [nd["degree"] for nd in nodes if nd["group"] == "ESCO_skill"]
+    non_deg = [nd["degree"] for nd in nodes if nd["group"] == "non_ESCO_skill"]
+
+    stats = {
+        "nodes": int(G.number_of_nodes()), "edges": int(G.number_of_edges()),
+        "avg_similarity": round(avg_similarity, 3),
+        "avg_clustering": clustering,
+        "largest_component_size": largest_component,
+        "avg_degree": round(float(np.mean(list(degree_centrality.values()))), 3) if degree_centrality else 0,
+        "ESCO_avg_degree": round(float(np.mean(esco_deg)), 3) if esco_deg else 0,
+        "non_ESCO_avg_degree": round(float(np.mean(non_deg)), 3) if non_deg else 0,
+    }
+    return G, nodes, edges, stats
+
+
+def _explainability_metrics(high_conf_skills: list) -> dict:
+    if not high_conf_skills:
+        return {"avg_similarity": 0, "avg_confidence": 0,
+                "similarity_distribution": {}, "confidence_distribution": {}}
+    sims = [m["similarity"] for m in high_conf_skills]
+    confs = [m["confidence"] for m in high_conf_skills]
+    return {
+        "avg_similarity": round(float(np.mean(sims)), 3),
+        "avg_confidence": round(float(np.mean(confs)), 3),
+        "similarity_distribution": {
+            "0.6-0.7": sum(0.6 <= s < 0.7 for s in sims),
+            "0.7-0.8": sum(0.7 <= s < 0.8 for s in sims),
+            "0.8-1.0": sum(s >= 0.8 for s in sims),
+        },
+        "confidence_distribution": {
+            "0.6-0.7": sum(0.6 <= c < 0.7 for c in confs),
+            "0.7-0.8": sum(0.7 <= c < 0.8 for c in confs),
+            "0.8-1.0": sum(c >= 0.8 for c in confs),
+        }
+    }
+
+
+def _occ_code(occ: str) -> str:
+    match = re.search(r'C\d+$', occ)
+    return match.group(0) if match else occ.replace('/', '_').replace(':', '').replace('.', '')
+
+
+# ============================================================
+#  ANALYSIS: /law-policies_extend_esco  (unchanged logic)
+# ============================================================
+
 @analysis_router.get("/law-policies_extend_esco")
 def law_policies_extend_esco(
     keywords: str = Query(..., description="Comma-separated keywords (e.g. data,ai,green)"),
     source: str = Query("eur_lex", description="Source of the policies"),
-    similarity_threshold: float = Query(0.8, description="TF-IDF similarity threshold"),
-    confidence_threshold: float = Query(0.6, description="Confidence cutoff for adding new skills")
+    similarity_threshold: float = Query(0.8),
+    confidence_threshold: float = Query(0.6)
 ):
-    """
-    Extend the ESCO taxonomy by matching policy-linked ESCO skills with non-ESCO technology skills.
-    Computes network structure + centrality metrics for deeper analysis.
-    """
-    import pandas as pd, requests, os, numpy as np, networkx as nx
-    from dotenv import load_dotenv
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    from collections import defaultdict
-    import traceback
-
     try:
-        # === Authenticate ===
-        load_dotenv()
-        API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-        USERNAME = os.getenv("TRACKER_USERNAME", "")
-        PASSWORD = os.getenv("TRACKER_PASSWORD", "")
-
-        print("🔐 Authenticating with Tracker...")
-        res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
-        res.raise_for_status()
-        token = res.text.replace('"', "")
+        print("🔐 Authenticating...")
+        token = _get_token()
         headers = {"Authorization": f"Bearer {token}"}
 
-        # === Retrieve Law/Policy Documents ===
         keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
         payload = {"keywords": keywords_list, "keywords_logic": "or", "sources": [source]}
         all_docs = []
         for page in range(1, 51):
-            url = f"{API}/law-policies?page={page}&page_size=100"
+            url = f"{os.getenv('TRACKER_API')}/law-policies?page={page}&page_size=100"
             res = requests.post(url, headers=headers, data=payload, timeout=60)
             if res.status_code != 200:
                 break
@@ -60,1029 +501,443 @@ def law_policies_extend_esco(
                 break
         print(f"📄 Retrieved {len(all_docs)} policy documents.")
 
-        # === Extract Skill URIs ===
-        skill_uris = [s for d in all_docs for s in d.get("skills", []) if isinstance(s, str) and s.startswith("http")]
-        unique_uris = sorted(set(skill_uris))
-
-        # === Map URIs → ESCO Labels ===
-        print("🗺️ Mapping ESCO URIs to skill labels...")
-        id_to_label = {}
-        all_esco = []
-        for page in range(1, 51):
-            r = requests.post(f"{API}/skills?page={page}&page_size=100", headers=headers, timeout=30)
-            if r.status_code != 200:
-                break
-            items = r.json().get("items", [])
-            if not items:
-                break
-            all_esco.extend(items)
-            if len(items) < 100:
-                break
-        for s in all_esco:
-            sid = s.get("id")
-            label = s.get("label", "").strip().lower()
-            if sid and label:
-                id_to_label[sid] = label
-        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in unique_uris})
+        skill_uris = sorted(set(s for d in all_docs for s in d.get("skills", []) if isinstance(s, str) and s.startswith("http")))
+        id_to_label = _batch_resolve_skills(headers, skill_uris)
+        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in skill_uris})
         print(f"🧠 {len(ESCO_skill_labels)} unique ESCO skills mapped.")
 
-        # === Load Technology Skills (non-ESCO) ===
-        csv_path = "technology_skills.csv"
-        tech_df = pd.read_csv(csv_path, sep=None, engine='python', on_bad_lines='skip')
-        tech_examples = []
-        for row in tech_df["Example"].dropna().astype(str):
-            tech_examples.extend([s.strip().lower() for s in row.replace(";", ",").split(",") if s.strip()])
-        non_ESCO_skills = sorted(set(tech_examples))
+        non_ESCO_skills, skill_source = _load_non_esco_skills()
 
-        # === Similarity Computation ===
-        corpus = ESCO_skill_labels + non_ESCO_skills
-        vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4))
-        tfidf = vec.fit_transform(corpus)
-        esco_emb = tfidf[:len(ESCO_skill_labels)]
-        non_emb = tfidf[len(ESCO_skill_labels):]
-        sim = cosine_similarity(esco_emb, non_emb)
-
-        matches = []
-        for i, esco_skill in enumerate(ESCO_skill_labels):
-            scores = sim[i]
-            j = np.argmax(scores)
-            sc = scores[j]
-            if sc >= similarity_threshold:
-                matches.append({"ESCO_skill": esco_skill, "non_ESCO_skill": non_ESCO_skills[j], "similarity": round(float(sc), 3)})
-
-        # === Confidence & Filtering ===
         freq = defaultdict(int)
         for d in all_docs:
             for s in d.get("skills", []):
                 if s in id_to_label:
                     freq[id_to_label[s]] += 1
-        for m in matches:
-            f = freq.get(m["ESCO_skill"], 1)
-            m["confidence"] = round(m["similarity"] * (1 + np.log1p(f) / 10), 3)
-        new_skills = [m for m in matches if m["non_ESCO_skill"] not in id_to_label.values()]
-        high_conf = [m for m in new_skills if m["confidence"] >= confidence_threshold]
+
+        matches, high_conf = _compute_similarity(ESCO_skill_labels, non_ESCO_skills, similarity_threshold, confidence_threshold, freq, skill_source)
         proposed = sorted({m["non_ESCO_skill"] for m in high_conf})
+        G, nodes, edges, net_stats = _build_network(high_conf)
 
-        # === Prepare Association Rule–style Output ===
-        associations = [
-            {
-                "ESCO_skill": m["ESCO_skill"],
-                "non_ESCO_skill": m["non_ESCO_skill"],
-                "similarity": m["similarity"],
-                "confidence": m["confidence"]
-            }
-            for m in high_conf
-        ]
-
-        # === Build Network ===
-        print("🌐 Building skill network...")
-        G = nx.Graph()
-        for m in high_conf:
-            e, n = m["ESCO_skill"], m["non_ESCO_skill"]
-            G.add_node(e, group="ESCO_skill")
-            G.add_node(n, group="non_ESCO_skill")
-            G.add_edge(e, n, similarity=m["similarity"], confidence=m["confidence"])
-
-        # === Compute Network Metrics ===
-        if G.number_of_edges() > 0:
-            raw_degree = dict(G.degree())
-            degree_centrality = {k: round(v, 3) for k, v in nx.degree_centrality(G).items()}
-            avg_similarity = np.mean([d["similarity"] for _, _, d in G.edges(data=True)])
-            clustering = round(nx.average_clustering(G), 3)
-            components = [len(c) for c in nx.connected_components(G)]
-            largest_component = max(components) if components else 0
-        else:
-            raw_degree, degree_centrality, avg_similarity, clustering, largest_component = {}, {}, 0, 0, 0
-
-        # === Nodes with both raw and normalized degree ===
-        nodes = [
-            {
-                "id": n,
-                "group": G.nodes[n]["group"],
-                "degree": raw_degree.get(n, 0),
-                "degree_centrality": degree_centrality.get(n, 0)
-            }
-            for n in G.nodes()
-        ]
-
-        # === Edges for association rule–style graph ===
-        edges = [
-            {"source": u, "target": v, **d}
-            for u, v, d in G.edges(data=True)
-        ]
-
-        # === Compute per-group degree averages ===
-        esco_degrees = [n["degree"] for n in nodes if n["group"] == "ESCO_skill"]
-        non_esco_degrees = [n["degree"] for n in nodes if n["group"] == "non_ESCO_skill"]
-        group_degree_stats = {
-            "ESCO_avg_degree": round(np.mean(esco_degrees), 3) if esco_degrees else 0,
-            "non_ESCO_avg_degree": round(np.mean(non_esco_degrees), 3) if non_esco_degrees else 0
-        }
-
-        # === Save & Return Final Output ===
         pd.DataFrame(high_conf).to_csv("ESCOplus_Extended_from_Policies.csv", index=False)
-        print(f"💾 Saved {len(high_conf)} new ESCO+ skills and {len(edges)} edges.")
-
-
+        print(f"💾 Saved {len(high_conf)} new ESCO+ skills.")
 
         return {
             "message": "✅ ESCOPlus taxonomy extended with network metrics.",
             "summary": {
                 "Policies processed": len(all_docs),
                 "Mapped ESCO skills": len(ESCO_skill_labels),
-                "Non-ESCO skills": len(non_ESCO_skills),
+                "Non-ESCO skill pool (CSV+AI+Green)": len(non_ESCO_skills),
                 "Matches found": len(matches),
                 "Proposed ESCO+ extensions": len(high_conf)
             },
-            "associations": associations[:50],  # direct skill pairs
-            "network": {
-                "nodes": nodes,
-                "edges": edges
-            },
-            "network_stats": {
-                "nodes": G.number_of_nodes(),
-                "edges": G.number_of_edges(),
-                "avg_similarity": round(float(avg_similarity), 3),
-                "avg_clustering": clustering,
-                "largest_component_size": largest_component,
-                "avg_degree": round(np.mean(list(degree_centrality.values())), 3) if degree_centrality else 0,
-                **group_degree_stats
-            }
+            "associations": [{"ESCO_skill": m["ESCO_skill"], "non_ESCO_skill": m["non_ESCO_skill"],
+                               "similarity": m["similarity"], "confidence": m["confidence"]} for m in high_conf[:50]],
+            "network": {"nodes": nodes, "edges": edges},
+            "network_stats": net_stats
         }
-
-
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
+
+
+# ============================================================
+#  ANALYSIS: /profiles_extend_esco  (unchanged logic)
+# ============================================================
 
 @analysis_router.get("/profiles_extend_esco")
 def profiles_extend_esco(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g. AI, data, education)"),
-    source: str = Query(None, description="Optional source filter for profiles (e.g. linkedin, eurofound)"),
-    similarity_threshold: float = Query(0.8, description="Cosine similarity threshold for alternative label detection"),
-    confidence_threshold: float = Query(0.6, description="Confidence threshold for including new skills"),
-    max_pages: int = Query(10, description="Maximum number of pages to fetch (each page = 100 profiles)")
+    keywords: str = Query(...),
+    source: str = Query(None),
+    similarity_threshold: float = Query(0.8),
+    confidence_threshold: float = Query(0.6),
+    max_pages: int = Query(10)
 ):
-    """
-    Fetch filtered profiles from Tracker API using keywords and optional filters.
-    Extract ESCO skill labels, compare them with Technology Skills CSV,
-    and identify new ESCO+ skills using similarity and confidence metrics.
-    """
-    import os, requests, numpy as np, pandas as pd
-    from dotenv import load_dotenv
-    from collections import defaultdict
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    import traceback
-
     try:
-        # === 1️⃣ Authenticate ===
-        load_dotenv()
-        API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-        USERNAME = os.getenv("TRACKER_USERNAME", "")
-        PASSWORD = os.getenv("TRACKER_PASSWORD", "")
+        print("🔐 Authenticating...")
+        token = _get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        }
 
-        print("🔐 Authenticating with Tracker...")
-        res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
-        res.raise_for_status()
-        token = res.text.replace('"', "")
-        headers = {"Authorization": f"Bearer {token}"}
-        print("✅ Authenticated successfully.")
-
-        # === 2️⃣ Fetch Profiles ===
         keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
-        print(f"📡 Fetching profiles matching: {keywords_list}")
-        if source:
-            print(f"🗂️ Source filter applied: {source}")
-        else:
-            print("🗂️ No source filter applied.")
-
         all_profiles = []
         for page in range(1, max_pages + 1):
-            form_data = [
-                ("keywords_logic", "or"),
-                ("skill_ids_logic", "or"),
-            ]
+            form_data = [("keywords_logic", "or"), ("skill_ids_logic", "or")]
             for kw in keywords_list:
                 form_data.append(("keywords", kw))
             if source:
                 form_data.append(("sources", source))
-
-            url = f"{API}/profiles?page={page}&page_size=100"
-            print(f"📄 Fetching page {page}/{max_pages}...")
-
-            res = requests.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json"
-                },
-                data=form_data,
-                timeout=90
-            )
+            url = f"{os.getenv('TRACKER_API')}/profiles?page={page}&page_size=100"
+            res = requests.post(url, headers=headers, data=form_data, timeout=90)
             if res.status_code != 200:
-                print(f"⚠️ Page {page}: HTTP {res.status_code}")
                 break
-
-            data = res.json()
-            items = data.get("items", [])
+            items = res.json().get("items", [])
             if not items:
-                print("✅ No more results — stopping.")
                 break
-
             all_profiles.extend(items)
             if len(items) < 100:
-                print("✅ Last page reached.")
                 break
-
-        print(f"🎯 Total profiles retrieved: {len(all_profiles)}")
+        print(f"🎯 Total profiles: {len(all_profiles)}")
         if not all_profiles:
-            return {"error": "No profiles found for the given filters."}
+            return {"error": "No profiles found."}
 
-        # === 3️⃣ Extract skill URIs and map to labels ===
-        print("🧩 Extracting ESCO skill URIs from profiles...")
-        skill_uris = []
-        for profile in all_profiles:
-            skill_uris.extend([s for s in profile.get("skills", []) if isinstance(s, str) and s.startswith("http")])
+        skill_uris = sorted(set(s for p in all_profiles for s in p.get("skills", []) if isinstance(s, str) and s.startswith("http")))
+        id_to_label = _batch_resolve_skills(headers, skill_uris)
+        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in skill_uris})
 
-        unique_uris = sorted(set(skill_uris))
-        print(f"🔗 Found {len(unique_uris)} unique skill URIs.")
+        non_ESCO_skills, skill_source = _load_non_esco_skills()
 
-        id_to_label = {}
-        if unique_uris:
-            print("📚 Fetching ESCO labels for skills...")
-            all_esco = []
-            for page in range(1, 51):
-                r = requests.post(f"{API}/skills?page={page}&page_size=100", headers=headers, timeout=30)
-                if r.status_code != 200:
-                    break
-                data = r.json()
-                items = data.get("items", [])
-                if not items:
-                    break
-                all_esco.extend(items)
-                if len(items) < 100:
-                    break
-            id_to_label = {s["id"]: s.get("label", "").strip().lower() for s in all_esco if "id" in s}
-            print(f"✅ Retrieved {len(id_to_label)} ESCO labels.")
-
-        ESCO_skill_labels = [id_to_label.get(uri, uri) for uri in unique_uris]
-        ESCO_skill_labels = sorted(set(ESCO_skill_labels))
-        print(f"🧠 Mapped {len(ESCO_skill_labels)} ESCO skills from profiles.")
-
-        # === 4️⃣ Load Technology Skills CSV ===
-        csv_path = "technology_skills.csv"
-        tech_df = pd.read_csv(csv_path, sep=None, engine='python', on_bad_lines='skip')
-        if "Example" not in tech_df.columns:
-            return {"error": "CSV must contain an 'Example' column."}
-
-        tech_examples = []
-        for row in tech_df["Example"].dropna().astype(str):
-            tech_examples.extend([s.strip().lower() for s in row.replace(";", ",").split(",") if s.strip()])
-        non_ESCO_skills = sorted(set(tech_examples))
-        print(f"💾 Loaded {len(non_ESCO_skills)} non-ESCO technology skills.")
-
-        # === 5️⃣ Compute Similarity ===
-        print("🔍 Computing similarity between ESCO and non-ESCO skills...")
-        corpus = list(ESCO_skill_labels) + list(non_ESCO_skills)
-        vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4))
-        tfidf = vectorizer.fit_transform(corpus)
-        esco_emb = tfidf[:len(ESCO_skill_labels)]
-        non_esco_emb = tfidf[len(ESCO_skill_labels):]
-        sim_matrix = cosine_similarity(esco_emb, non_esco_emb)
-
-        matches = []
-        for i, esco_skill in enumerate(ESCO_skill_labels):
-            sim_scores = sim_matrix[i]
-            best_idx = np.argmax(sim_scores)
-            best_score = sim_scores[best_idx]
-            if best_score >= similarity_threshold:
-                non_esco_match = non_ESCO_skills[best_idx]
-                matches.append({
-                    "ESCO_skill": esco_skill,
-                    "non_ESCO_skill": non_esco_match,
-                    "similarity": round(float(best_score), 3)
-                })
-                if i < 3:
-                    print(f"✅ {esco_skill} ↔ {non_esco_match} ({best_score:.3f})")
-
-        print(f"🔗 Found {len(matches)} ESCO ↔ non-ESCO matches.")
-
-        # === 6️⃣ Compute Confidence + Identify new ESCO+ skills ===
-        esco_labels = set(id_to_label.values())
-        new_skills = [m for m in matches if m["non_ESCO_skill"] not in esco_labels]
-
-        # Frequency weighting (how often ESCO skill appears in profiles)
-        profile_freq = defaultdict(int)
-        for profile in all_profiles:
-            for s in profile.get("skills", []):
+        freq = defaultdict(int)
+        for p in all_profiles:
+            for s in p.get("skills", []):
                 if s in id_to_label:
-                    label = id_to_label[s]
-                    profile_freq[label] += 1
+                    freq[id_to_label[s]] += 1
 
-        for m in new_skills:
-            freq = profile_freq.get(m["ESCO_skill"], 1)
-            m["confidence"] = round(float(m["similarity"] * (1 + np.log1p(freq) / 10)), 3)
+        matches, high_conf = _compute_similarity(ESCO_skill_labels, non_ESCO_skills, similarity_threshold, confidence_threshold, freq, skill_source)
+        proposed = sorted({m["non_ESCO_skill"] for m in high_conf})
+        G, nodes, edges, net_stats = _build_network(high_conf)
 
-        high_conf_skills = [m for m in new_skills if m["confidence"] >= confidence_threshold]
-        proposed_extensions = sorted(set([m["non_ESCO_skill"] for m in high_conf_skills]))
-
-        print(f"🚀 {len(high_conf_skills)} high-confidence new ESCO+ skills proposed.")
-
-        # === 7️⃣ Save Extended Taxonomy ===
         output_path = "ESCOplus_Extended_from_Profiles.csv"
-        pd.DataFrame(high_conf_skills).to_csv(output_path, index=False)
-        print(f"💾 Extended taxonomy saved to {output_path}")
+        pd.DataFrame(high_conf).to_csv(output_path, index=False)
 
-        # === 🌐 Build Skill Network (ESCO ↔ non-ESCO) ===
-        import networkx as nx
-
-        print("🌐 Building skill network for visualization and metrics...")
-        G = nx.Graph()
-
-        for m in high_conf_skills:
-            e, n = m["ESCO_skill"], m["non_ESCO_skill"]
-            G.add_node(e, group="ESCO_skill")
-            G.add_node(n, group="non_ESCO_skill")
-            G.add_edge(e, n, similarity=m["similarity"], confidence=m["confidence"])
-
-        # === 🧮 Compute Network Metrics ===
-        if G.number_of_edges() > 0:
-            raw_degree = dict(G.degree())
-            degree_centrality = {k: round(v, 3) for k, v in nx.degree_centrality(G).items()}
-            avg_similarity = np.mean([d["similarity"] for _, _, d in G.edges(data=True)])
-            clustering = round(nx.average_clustering(G), 3)
-            components = [len(c) for c in nx.connected_components(G)]
-            largest_component = max(components) if components else 0
-        else:
-            raw_degree, degree_centrality, avg_similarity, clustering, largest_component = {}, {}, 0, 0, 0
-
-        # === 🧩 Prepare Nodes ===
-        nodes = [
-            {
-                "id": n,
-                "group": G.nodes[n]["group"],
-                "degree": raw_degree.get(n, 0),
-                "degree_centrality": degree_centrality.get(n, 0)
-            }
-            for n in G.nodes()
-        ]
-
-        # === 🔗 Prepare Edges (Association-style) ===
-        edges = [
-            {"source": u, "target": v, **d}
-            for u, v, d in G.edges(data=True)
-        ]
-
-        # === 📊 Per-Group Degree Stats ===
-        esco_degrees = [n["degree"] for n in nodes if n["group"] == "ESCO_skill"]
-        non_esco_degrees = [n["degree"] for n in nodes if n["group"] == "non_ESCO_skill"]
-        group_degree_stats = {
-            "ESCO_avg_degree": round(np.mean(esco_degrees), 3) if esco_degrees else 0,
-            "non_ESCO_avg_degree": round(np.mean(non_esco_degrees), 3) if non_esco_degrees else 0
-        }
-
-        # === 🧠 Attach to the Output JSON ===
-        network_data = {
-            "nodes": nodes,
-            "edges": edges,
-            "stats": {
-                "nodes": G.number_of_nodes(),
-                "edges": G.number_of_edges(),
-                "avg_similarity": round(float(avg_similarity), 3),
-                "avg_clustering": clustering,
-                "largest_component_size": largest_component,
-                "avg_degree": round(np.mean(list(degree_centrality.values())), 3) if degree_centrality else 0,
-                **group_degree_stats
-            }
-        }
-
-        # === 7️⃣ Explainability Metrics ===
-        print("📊 Computing explainability metrics (similarity + confidence)...")
-
-        if high_conf_skills:
-            similarities = [m["similarity"] for m in high_conf_skills]
-            confidences = [m["confidence"] for m in high_conf_skills]
-
-            explainability_metrics = {
-                "avg_similarity": round(float(np.mean(similarities)), 3),
-                "avg_confidence": round(float(np.mean(confidences)), 3),
-                "similarity_distribution": {
-                    "0.6-0.7": sum(0.6 <= s < 0.7 for s in similarities),
-                    "0.7-0.8": sum(0.7 <= s < 0.8 for s in similarities),
-                    "0.8-1.0": sum(s >= 0.8 for s in similarities),
-                },
-                "confidence_distribution": {
-                    "0.6-0.7": sum(0.6 <= c < 0.7 for c in confidences),
-                    "0.7-0.8": sum(0.7 <= c < 0.8 for c in confidences),
-                    "0.8-1.0": sum(c >= 0.8 for c in confidences),
-                }
-            }
-        else:
-            explainability_metrics = {
-                "avg_similarity": 0,
-                "avg_confidence": 0,
-                "similarity_distribution": {},
-                "confidence_distribution": {}
-            }
-
-        # === ✅ Return Results ===
         return {
-            "message": "✅ ESCOPlus taxonomy successfully extended using profile-derived skills.",
+            "message": "✅ ESCOPlus taxonomy extended from profiles.",
             "summary": {
                 "Profiles processed": len(all_profiles),
                 "ESCO skills mapped": len(ESCO_skill_labels),
-                "Non-ESCO skills (CSV)": len(non_ESCO_skills),
+                "Non-ESCO skill pool (CSV+AI+Green)": len(non_ESCO_skills),
                 "Matches found": len(matches),
-                "High-confidence new skills": len(high_conf_skills)
+                "High-confidence new skills": len(high_conf)
             },
-            "proposed_extensions": proposed_extensions[:100],
-            "explainability_metrics": explainability_metrics,
-            "new_skills_preview": high_conf_skills[:20],
+            "proposed_extensions": proposed[:100],
+            "explainability_metrics": _explainability_metrics(high_conf),
+            "new_skills_preview": high_conf[:20],
             "output_file": output_path,
-            "network": network_data
+            "network": {"nodes": nodes, "edges": edges, "stats": net_stats}
         }
-
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
+
+
+# ============================================================
+#  ANALYSIS: /jobs_ultra
+#  Fetching logic mirrors /jobsd-forecast (cache, auto-pagination,
+#  occupation_ids, retry). Analysis logic: similarity + confidence
+#  + network metrics + explainability — unchanged.
+# ============================================================
 
 @analysis_router.get("/jobs_ultra")
 def jobs_extend_esco_ultra(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g. AI, data, software)"),
-    source: str = Query(None, description="Optional source filter (e.g. linkedin, indeed)"),
-    min_upload_date: str = Query(None, description="Minimum upload date (YYYY-MM-DD)"),
-    max_upload_date: str = Query(None, description="Maximum upload date (YYYY-MM-DD)"),
-    similarity_threshold: float = Query(0.8, description="Cosine similarity threshold for alternative label detection"),
-    confidence_threshold: float = Query(0.6, description="Confidence threshold for including new skills"),
-    max_pages: int = Query(10, description="Maximum number of pages to fetch (each page = 100 jobs)")
+    keywords: Optional[str] = Query(None, description="Comma-separated keywords (e.g. AI, data, software)"),
+    occupation_ids: Optional[str] = Query(None, description="Comma-separated occupation IDs (e.g. http://data.europa.eu/esco/isco/C2153)"),
+    source: Optional[str] = Query(None, description="Optional source filter (e.g. linkedin, indeed)"),
+    min_upload_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    max_upload_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    similarity_threshold: float = Query(0.8, description="TF-IDF cosine similarity threshold"),
+    confidence_threshold: float = Query(0.6, description="Confidence cutoff for adding new skills"),
 ):
     """
-    Fetch filtered job postings from the Tracker API using keywords and optional filters.
-    Extract ESCO skill labels, compare them with Technology Skills CSV,
-    and identify new ESCO+ skills using similarity and confidence metrics.
+    Fetch ALL job postings (auto-paginated, retry, occupation_ids support),
+    extend ESCO taxonomy via TF-IDF similarity against CSV + AI + Green skill pools,
+    build a skill co-occurrence network, compute explainability metrics.
+    Results cached in Completed_Analyses/.
     """
-    import os, requests, numpy as np, pandas as pd
-    from dotenv import load_dotenv
-    from collections import defaultdict
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    import traceback
-
     try:
-        # === 1️⃣ Authenticate with Tracker ===
-        load_dotenv()
-        API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-        USERNAME = os.getenv("TRACKER_USERNAME", "")
-        PASSWORD = os.getenv("TRACKER_PASSWORD", "")
 
+        # ================================================================
+        # 📁 CACHE SETUP — same pattern as /jobsd-forecast
+        # ================================================================
+        folder = _ensure_cache_folder()
+        keywords_list = [k.strip() for k in keywords.split(",") if k.strip()] if keywords else []
+        occ_ids_list  = [o.strip() for o in occupation_ids.split(",") if o.strip()] if occupation_ids else []
+
+        filename = "completed_analysis_jobs_ultra_esco"
+        for kw in keywords_list:
+            filename += f"_{kw}"
+        for occ in occ_ids_list:
+            filename += f"_{_occ_code(occ)}"
+        if source:
+            filename += f"_{source}"
+        if min_upload_date:
+            filename += f"_from{min_upload_date}"
+        if max_upload_date:
+            filename += f"_to{max_upload_date}"
+        filename += f"_sim{similarity_threshold}_conf{confidence_threshold}.json"
+
+        file_path = folder / filename
+        print(f"🗂️  Cache path: {file_path}")
+
+        if file_path.exists():
+            print(f"✅ Cache hit — loading from '{file_path}' (skipping all API calls).")
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    return json.loads(f.read())
+            except (json.JSONDecodeError, ValueError) as cache_err:
+                print(f"⚠️  Cache file corrupted ({cache_err}) — deleting and re-running...")
+                file_path.unlink()
+
+        # ================================================================
+        # 1️⃣  AUTHENTICATE
+        # ================================================================
+        print("🌐 No cache found — running full analysis...")
         print("🔐 Authenticating with Tracker...")
-        res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
-        res.raise_for_status()
-        token = res.text.replace('"', "")
-        headers = {"Authorization": f"Bearer {token}"}
+        token = _get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        }
         print("✅ Authenticated successfully.")
+        print(f"📡 Keywords     : {keywords_list or '(none)'}")
+        print(f"🏢 OccupationIDs: {occ_ids_list  or '(none)'}")
+        print(f"🗃️  Source       : {source or '(none)'}")
+        print(f"📅 Date range   : {min_upload_date or '*'} → {max_upload_date or '*'}")
+        print(f"⚙️  Thresholds   : similarity={similarity_threshold}, confidence={confidence_threshold}")
 
-        # === 2️⃣ Fetch Job Postings ===
-        keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
-        print(f"📡 Fetching jobs for keywords: {keywords_list}")
-
-        all_jobs = []
-        for page in range(1, max_pages + 1):
-            form_data = [
-                ("keywords_logic", "or"),
-                ("skill_ids_logic", "or"),
-                ("occupation_ids_logic", "or")
-            ]
+        # ================================================================
+        # 2️⃣  AUTO-PAGINATE ALL JOB PAGES WITH RETRY
+        #     Identical to /jobsd-forecast
+        # ================================================================
+        def build_form():
+            fd = [("keywords_logic", "or"), ("skill_ids_logic", "or"), ("occupation_ids_logic", "or")]
             for kw in keywords_list:
-                form_data.append(("keywords", kw))
+                fd.append(("keywords", kw))
+            for occ in occ_ids_list:
+                fd.append(("occupation_ids", occ))
             if source:
-                form_data.append(("sources", source))
+                fd.append(("sources", source))
             if min_upload_date:
-                form_data.append(("min_upload_date", min_upload_date))
+                fd.append(("min_upload_date", min_upload_date))
             if max_upload_date:
-                form_data.append(("max_upload_date", max_upload_date))
+                fd.append(("max_upload_date", max_upload_date))
+            return fd
 
-            url = f"{API}/jobs?page={page}&page_size=100"
-            res = requests.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json"
-                },
-                data=form_data,
-                timeout=90
-            )
-            if res.status_code != 200:
-                print(f"⚠️ Page {page}: HTTP {res.status_code}")
-                break
+        all_jobs, total_count = _auto_paginate("jobs", headers, build_form)
 
-            data = res.json()
-            items = data.get("items", [])
-            if not items:
-                break
-
-            all_jobs.extend(items)
-            if len(items) < 100:
-                break
-
-        print(f"🎯 Total job postings retrieved: {len(all_jobs)}")
         if not all_jobs:
             return {"error": "No job postings found for the given filters."}
 
-        # === 3️⃣ Extract skill URIs and map to labels ===
+        print(f"✅ {len(all_jobs)} / {total_count} total jobs retrieved.")
+
+        # ================================================================
+        # 3️⃣  EXTRACT SKILL URIs + BATCH RESOLVE TO LABELS
+        # ================================================================
         print("🧩 Extracting ESCO skill URIs from jobs...")
-        skill_uris = []
-        for job in all_jobs:
-            skill_uris.extend([s for s in job.get("skills", []) if isinstance(s, str) and s.startswith("http")])
+        skill_uris = sorted(set(
+            s for j in all_jobs
+            for s in j.get("skills", [])
+            if isinstance(s, str) and s.startswith("http")
+        ))
+        print(f"🔗 Found {len(skill_uris)} unique skill URIs.")
 
-        unique_uris = sorted(set(skill_uris))
-        print(f"🔗 Found {len(unique_uris)} unique skill URIs.")
+        id_to_label = _batch_resolve_skills(headers, skill_uris)
+        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in skill_uris})
+        print(f"🧠 {len(ESCO_skill_labels)} unique ESCO skill labels mapped from jobs.")
 
-        id_to_label = {}
-        if unique_uris:
-            print("📚 Fetching ESCO labels for skills...")
-            all_esco = []
-            for page in range(1, 51):
-                r = requests.post(f"{API}/skills?page={page}&page_size=100", headers=headers, timeout=30)
-                if r.status_code != 200:
-                    break
-                data = r.json()
-                items = data.get("items", [])
-                if not items:
-                    break
-                all_esco.extend(items)
-                if len(items) < 100:
-                    break
-            id_to_label = {s["id"]: s.get("label", "").strip().lower() for s in all_esco if "id" in s}
-            print(f"✅ Retrieved {len(id_to_label)} ESCO labels.")
+        if not ESCO_skill_labels:
+            return {"error": "No ESCO skills could be resolved from the fetched jobs."}
 
-        ESCO_skill_labels = [id_to_label.get(uri, uri) for uri in unique_uris]
-        ESCO_skill_labels = sorted(set(ESCO_skill_labels))
-        print(f"🧠 Mapped {len(ESCO_skill_labels)} ESCO skills from jobs.")
+        # ================================================================
+        # 4️⃣  LOAD NON-ESCO SKILL POOL (CSV + AI + GREEN)
+        # ================================================================
+        non_ESCO_skills, skill_source = _load_non_esco_skills()
+        print(f"📦 Non-ESCO skill pool: {len(non_ESCO_skills)} skills (CSV + AI extended + Green extended).")
 
-        # === 4️⃣ Load Technology Skills CSV ===
-        csv_path = "technology_skills.csv"
-        tech_df = pd.read_csv(csv_path, sep=None, engine='python', on_bad_lines='skip')
-        if "Example" not in tech_df.columns:
-            return {"error": "CSV must contain an 'Example' column."}
-
-        tech_examples = []
-        for row in tech_df["Example"].dropna().astype(str):
-            tech_examples.extend([s.strip().lower() for s in row.replace(";", ",").split(",") if s.strip()])
-        non_ESCO_skills = sorted(set(tech_examples))
-        print(f"💾 Loaded {len(non_ESCO_skills)} non-ESCO technology skills.")
-
-        # === 5️⃣ Compute Similarity ===
-        print("🔍 Computing similarity between ESCO and non-ESCO skills...")
-        corpus = list(ESCO_skill_labels) + list(non_ESCO_skills)
-        vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4))
-        tfidf = vectorizer.fit_transform(corpus)
-        esco_emb = tfidf[:len(ESCO_skill_labels)]
-        non_esco_emb = tfidf[len(ESCO_skill_labels):]
-        sim_matrix = cosine_similarity(esco_emb, non_esco_emb)
-
-        matches = []
-        for i, esco_skill in enumerate(ESCO_skill_labels):
-            sim_scores = sim_matrix[i]
-            best_idx = np.argmax(sim_scores)
-            best_score = sim_scores[best_idx]
-            if best_score >= similarity_threshold:
-                non_esco_match = non_ESCO_skills[best_idx]
-                matches.append({
-                    "ESCO_skill": esco_skill,
-                    "non_ESCO_skill": non_esco_match,
-                    "similarity": round(float(best_score), 3)
-                })
-                if i < 3:
-                    print(f"✅ {esco_skill} ↔ {non_esco_match} ({best_score:.3f})")
-
-        print(f"🔗 Found {len(matches)} ESCO ↔ non-ESCO matches.")
-
-        # === 6️⃣ Compute Confidence + Identify new ESCO+ skills ===
-        esco_labels = set(id_to_label.values())
-        new_skills = [m for m in matches if m["non_ESCO_skill"] not in esco_labels]
-
-        # Frequency weighting (how often ESCO skill appears in jobs)
-        job_freq = defaultdict(int)
-        for job in all_jobs:
-            for s in job.get("skills", []):
+        # ================================================================
+        # 5️⃣  BUILD ESCO SKILL FREQUENCY MAP (confidence weighting)
+        # ================================================================
+        print("📊 Building ESCO skill frequency map across all jobs...")
+        freq = defaultdict(int)
+        for j in all_jobs:
+            for s in j.get("skills", []):
                 if s in id_to_label:
-                    label = id_to_label[s]
-                    job_freq[label] += 1
+                    freq[id_to_label[s]] += 1
 
-        for m in new_skills:
-            freq = job_freq.get(m["ESCO_skill"], 1)
-            m["confidence"] = round(float(m["similarity"] * (1 + np.log1p(freq) / 10)), 3)
+        top_freq = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:10]
+        print(f"   Top 10 ESCO skills by frequency: {top_freq}")
 
-        high_conf_skills = [m for m in new_skills if m["confidence"] >= confidence_threshold]
-        proposed_extensions = sorted(set([m["non_ESCO_skill"] for m in high_conf_skills]))
+        # ================================================================
+        # 6️⃣  COMPUTE TF-IDF SIMILARITY + CONFIDENCE
+        # ================================================================
+        matches, high_conf = _compute_similarity(
+            ESCO_skill_labels, non_ESCO_skills,
+            similarity_threshold, confidence_threshold,
+            freq, skill_source
+        )
+        proposed = sorted({m["non_ESCO_skill"] for m in high_conf})
 
-        print(f"🚀 {len(high_conf_skills)} high-confidence new ESCO+ skills proposed.")
+        print(f"🔬 {len(matches)} total matches above similarity threshold.")
+        print(f"🚀 {len(high_conf)} high-confidence ESCO+ extensions proposed.")
+        print(f"   Source breakdown: { {s: sum(1 for m in high_conf if m['source']==s) for s in {'technology_csv','ai_extended','green_extended'}} }")
 
-        # === 7️⃣ Save Extended Taxonomy ===
-        output_path = "ESCOplus_Extended_from_Jobs.csv"
-        pd.DataFrame(high_conf_skills).to_csv(output_path, index=False)
-        print(f"💾 Extended taxonomy saved to {output_path}")
+        # ================================================================
+        # 7️⃣  BUILD SKILL NETWORK (ESCO ↔ non-ESCO)
+        # ================================================================
+        print("🌐 Building skill extension network (ESCO ↔ non-ESCO)...")
+        G, nodes, edges, net_stats = _build_network(high_conf)
+        print(f"   Network: {net_stats['nodes']} nodes, {net_stats['edges']} edges, "
+              f"avg_similarity={net_stats['avg_similarity']}, "
+              f"largest_component={net_stats['largest_component_size']}")
 
-        # === 🌐 Build Skill Network (ESCO ↔ non-ESCO from Jobs) ===
-        import networkx as nx
+        # ================================================================
+        # 8️⃣  EXPLAINABILITY METRICS
+        # ================================================================
+        print("📈 Computing explainability metrics...")
+        expl = _explainability_metrics(high_conf)
+        print(f"   avg_similarity={expl['avg_similarity']}, avg_confidence={expl['avg_confidence']}")
 
-        print("🌐 Building skill network from job-based matches...")
-        G = nx.Graph()
+        # ================================================================
+        # 9️⃣  SAVE LOCAL CSV
+        # ================================================================
+        output_csv = "ESCOplus_Extended_from_Jobs.csv"
+        pd.DataFrame(high_conf).to_csv(output_csv, index=False)
+        print(f"💾 Extended taxonomy CSV saved → '{output_csv}' ({len(high_conf)} rows).")
 
-        for m in high_conf_skills:
-            e, n = m["ESCO_skill"], m["non_ESCO_skill"]
-            G.add_node(e, group="ESCO_skill")
-            G.add_node(n, group="non_ESCO_skill")
-            G.add_edge(e, n, similarity=m["similarity"], confidence=m["confidence"])
-
-        # === 🧮 Compute Network Metrics ===
-        if G.number_of_edges() > 0:
-            raw_degree = dict(G.degree())
-            degree_centrality = {k: round(v, 3) for k, v in nx.degree_centrality(G).items()}
-            avg_similarity = np.mean([d["similarity"] for _, _, d in G.edges(data=True)])
-            clustering = round(nx.average_clustering(G), 3)
-            components = [len(c) for c in nx.connected_components(G)]
-            largest_component = max(components) if components else 0
-        else:
-            raw_degree, degree_centrality, avg_similarity, clustering, largest_component = {}, {}, 0, 0, 0
-
-        # === 🧩 Nodes and Edges ===
-        nodes = [
-            {
-                "id": n,
-                "group": G.nodes[n]["group"],
-                "degree": raw_degree.get(n, 0),
-                "degree_centrality": degree_centrality.get(n, 0)
-            }
-            for n in G.nodes()
-        ]
-
-        edges = [
-            {"source": u, "target": v, **d}
-            for u, v, d in G.edges(data=True)
-        ]
-
-        # === 📊 Group Degree Stats ===
-        esco_degrees = [n["degree"] for n in nodes if n["group"] == "ESCO_skill"]
-        non_esco_degrees = [n["degree"] for n in nodes if n["group"] == "non_ESCO_skill"]
-        group_degree_stats = {
-            "ESCO_avg_degree": round(np.mean(esco_degrees), 3) if esco_degrees else 0,
-            "non_ESCO_avg_degree": round(np.mean(non_esco_degrees), 3) if non_esco_degrees else 0
-        }
-
-        # === 🧠 Final Network Data Object ===
-        network_data = {
-            "nodes": nodes,
-            "edges": edges,
-            "stats": {
-                "nodes": G.number_of_nodes(),
-                "edges": G.number_of_edges(),
-                "avg_similarity": round(float(avg_similarity), 3),
-                "avg_clustering": clustering,
-                "largest_component_size": largest_component,
-                "avg_degree": round(np.mean(list(degree_centrality.values())), 3) if degree_centrality else 0,
-                **group_degree_stats
-            }
-        }
-
-        # === 7️⃣ Explainability Metrics ===
-        print("📊 Computing explainability metrics (similarity + confidence)...")
-
-        if high_conf_skills:
-            similarities = [m["similarity"] for m in high_conf_skills]
-            confidences = [m["confidence"] for m in high_conf_skills]
-
-            explainability_metrics = {
-                "avg_similarity": round(float(np.mean(similarities)), 3),
-                "avg_confidence": round(float(np.mean(confidences)), 3),
-                "similarity_distribution": {
-                    "0.6-0.7": sum(0.6 <= s < 0.7 for s in similarities),
-                    "0.7-0.8": sum(0.7 <= s < 0.8 for s in similarities),
-                    "0.8-1.0": sum(s >= 0.8 for s in similarities),
-                },
-                "confidence_distribution": {
-                    "0.6-0.7": sum(0.6 <= c < 0.7 for c in confidences),
-                    "0.7-0.8": sum(0.7 <= c < 0.8 for c in confidences),
-                    "0.8-1.0": sum(c >= 0.8 for c in confidences),
-                }
-            }
-        else:
-            explainability_metrics = {
-                "avg_similarity": 0,
-                "avg_confidence": 0,
-                "similarity_distribution": {},
-                "confidence_distribution": {}
-            }
-
-        # === ✅ Return Results ===
-        return {
-            "message": "✅ ESCOPlus taxonomy successfully extended using job-derived skills.",
-            "summary": {
-                "Job postings processed": len(all_jobs),
-                "ESCO skills mapped": len(ESCO_skill_labels),
-                "Non-ESCO skills (CSV)": len(non_ESCO_skills),
-                "Matches found": len(matches),
-                "High-confidence new skills": len(high_conf_skills)
+        # ================================================================
+        # 🔟  BUILD RESULT
+        # ================================================================
+        result = {
+            "message": "✅ ESCOPlus taxonomy extended from job postings.",
+            "filters_used": {
+                "keywords":        keywords_list or None,
+                "occupation_ids":  occ_ids_list  or None,
+                "source":          source,
+                "min_upload_date": min_upload_date,
+                "max_upload_date": max_upload_date,
             },
-            "proposed_extensions": proposed_extensions[:100],
-            "explainability_metrics": explainability_metrics,
-            "new_skills_preview": high_conf_skills[:20],
-            "output_file": output_path,
-            "network": network_data
+            "summary": {
+                "Job postings processed":          len(all_jobs),
+                "Total jobs available":            total_count,
+                "ESCO skills mapped":              len(ESCO_skill_labels),
+                "Non-ESCO skill pool (CSV+AI+Green)": len(non_ESCO_skills),
+                "Matches found":                   len(matches),
+                "High-confidence new skills":      len(high_conf),
+                "Source breakdown": {
+                    "technology_csv":  sum(1 for m in high_conf if m["source"] == "technology_csv"),
+                    "ai_extended":     sum(1 for m in high_conf if m["source"] == "ai_extended"),
+                    "green_extended":  sum(1 for m in high_conf if m["source"] == "green_extended"),
+                }
+            },
+            "proposed_extensions":    proposed[:100],
+            "explainability_metrics": expl,
+            "new_skills_preview":     high_conf[:20],
+            "output_file":            output_csv,
+            "network": {"nodes": nodes, "edges": edges, "stats": net_stats},
         }
 
+        # ================================================================
+        # 💾  CACHE
+        # ================================================================
+        result = _sanitize(result)
+        print(f"💾 Saving to cache: '{file_path}'...")
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(_safe_json_dumps(result))
+        print(f"✅ Cached successfully.")
+        return result
 
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
+
+# ============================================================
+#  ANALYSIS: /courses_ultra  (unchanged logic)
+# ============================================================
+
 @analysis_router.get("/courses_ultra")
 def courses_extend_esco(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g. data, ai, green)"),
-    source: str = Query(None, description="Optional source filter (e.g. Udacity, europass)"),
-    similarity_threshold: float = Query(0.8, description="Cosine similarity threshold for alternative label detection"),
-    confidence_threshold: float = Query(0.6, description="Confidence threshold for including new skills")
+    keywords: str = Query(...),
+    source: str = Query("coursera"),
+    similarity_threshold: float = Query(0.8),
+    confidence_threshold: float = Query(0.6)
 ):
-    """
-    Fetch filtered courses from Tracker,
-    extract ESCO skill labels, compare them with Technology Skills CSV,
-    and identify new ESCO+ skills using similarity and confidence metrics.
-    """
-    import os, requests, numpy as np, pandas as pd
-    from dotenv import load_dotenv
-    from collections import defaultdict
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    import traceback
-
     try:
-        # === 1️⃣ Authenticate with Tracker ===
-        load_dotenv()
-        API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-        USERNAME = os.getenv("TRACKER_USERNAME", "")
-        PASSWORD = os.getenv("TRACKER_PASSWORD", "")
+        print("🔐 Authenticating...")
+        token = _get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        }
 
-        print("🔐 Authenticating with Tracker...")
-        res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
-        res.raise_for_status()
-        token = res.text.replace('"', "")
-        headers = {"Authorization": f"Bearer {token}"}
-        print("✅ Authenticated successfully.")
-
-        # === 2️⃣ Fetch Courses from Tracker ===
         keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
-        print(f"📡 Querying /courses for {keywords_list}...")
-
-        all_courses, max_pages = [], 50
-        for page in range(1, max_pages + 1):
-            form_data = [
-                ("keywords_logic", "or"),
-                ("skill_ids_logic", "or"),
-                ("sources", source),
-            ]
+        all_courses = []
+        for page in range(1, 51):
+            form_data = [("keywords_logic", "or"), ("skill_ids_logic", "or"), ("sources", source)]
             for kw in keywords_list:
                 form_data.append(("keywords", kw))
-
-            url = f"{API}/courses?page={page}&page_size=100"
-            res = requests.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json"
-                },
-                data=form_data,
-                timeout=60
-            )
+            url = f"{os.getenv('TRACKER_API')}/courses?page={page}&page_size=100"
+            res = requests.post(url, headers=headers, data=form_data, timeout=60)
             if res.status_code != 200:
-                print(f"⚠️ Page {page}: HTTP {res.status_code}")
                 break
-
-            data = res.json()
-            items = data.get("items", [])
+            items = res.json().get("items", [])
             if not items:
                 break
             all_courses.extend(items)
             if len(items) < 100:
                 break
-
         print(f"📄 Retrieved {len(all_courses)} courses.")
-
         if not all_courses:
-            return {"error": "No courses found for the given keywords/source."}
+            return {"error": "No courses found."}
 
-        # === 3️⃣ Extract skill URIs and map to labels ===
-        print("🧩 Extracting ESCO skill URIs from courses...")
-        skill_uris = []
-        for course in all_courses:
-            skill_uris.extend([s for s in course.get("skills", []) if isinstance(s, str) and s.startswith("http")])
+        skill_uris = sorted(set(s for c in all_courses for s in c.get("skills", []) if isinstance(s, str) and s.startswith("http")))
+        id_to_label = _batch_resolve_skills(headers, skill_uris)
+        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in skill_uris})
 
-        unique_uris = sorted(set(skill_uris))
-        print(f"🔗 Found {len(unique_uris)} unique skill URIs.")
+        non_ESCO_skills, skill_source = _load_non_esco_skills()
 
-        id_to_label = {}
-        if unique_uris:
-            print("📚 Fetching ESCO labels for skills...")
-            all_esco = []
-            for page in range(1, 51):
-                r = requests.post(f"{API}/skills?page={page}&page_size=100", headers=headers, timeout=30)
-                if r.status_code != 200:
-                    break
-                data = r.json()
-                items = data.get("items", [])
-                if not items:
-                    break
-                all_esco.extend(items)
-                if len(items) < 100:
-                    break
-            id_to_label = {s["id"]: s.get("label", "").strip().lower() for s in all_esco if "id" in s}
-            print(f"✅ Retrieved {len(id_to_label)} skill labels.")
-
-        ESCO_skill_labels = [id_to_label.get(uri, uri) for uri in unique_uris]
-        ESCO_skill_labels = sorted(set(ESCO_skill_labels))
-        print(f"🧠 Mapped {len(ESCO_skill_labels)} ESCO skills from courses.")
-
-        # === 4️⃣ Load Technology Skills CSV ===
-        csv_path = "technology_skills.csv"
-        tech_df = pd.read_csv(csv_path, sep=None, engine='python', on_bad_lines='skip')
-        if "Example" not in tech_df.columns:
-            return {"error": "CSV must contain an 'Example' column."}
-
-        tech_examples = []
-        for row in tech_df["Example"].dropna().astype(str):
-            tech_examples.extend([s.strip().lower() for s in row.replace(";", ",").split(",") if s.strip()])
-        non_ESCO_skills = sorted(set(tech_examples))
-        print(f"💾 Loaded {len(non_ESCO_skills)} technology (non-ESCO) skills.")
-
-        # === 5️⃣ Compute Similarity between course ESCO and non-ESCO ===
-        print("🔍 Computing similarity...")
-        corpus = list(ESCO_skill_labels) + list(non_ESCO_skills)
-        vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4))
-        tfidf = vectorizer.fit_transform(corpus)
-        esco_emb = tfidf[:len(ESCO_skill_labels)]
-        non_esco_emb = tfidf[len(ESCO_skill_labels):]
-        sim_matrix = cosine_similarity(esco_emb, non_esco_emb)
-
-        matches = []
-        for i, esco_skill in enumerate(ESCO_skill_labels):
-            sim_scores = sim_matrix[i]
-            best_idx = np.argmax(sim_scores)
-            best_score = sim_scores[best_idx]
-            if best_score >= similarity_threshold:
-                non_esco_match = non_ESCO_skills[best_idx]
-                matches.append({
-                    "ESCO_skill": esco_skill,
-                    "non_ESCO_skill": non_esco_match,
-                    "similarity": round(float(best_score), 3)
-                })
-                if i < 3:
-                    print(f"✅ {esco_skill} ↔ {non_esco_match} ({best_score:.3f})")
-
-        print(f"🔗 Found {len(matches)} ESCO ↔ non-ESCO matches.")
-
-        # === 6️⃣ Compute Confidence + Identify new ESCO+ skills ===
-        print("📈 Computing confidence and selecting new skills...")
-        esco_labels = set(id_to_label.values())
-        new_skills = [m for m in matches if m["non_ESCO_skill"] not in esco_labels]
-
-        # Frequency weighting by course occurrence
-        policy_freq = defaultdict(int)
-        for course in all_courses:
-            for s in course.get("skills", []):
+        freq = defaultdict(int)
+        for c in all_courses:
+            for s in c.get("skills", []):
                 if s in id_to_label:
-                    label = id_to_label[s]
-                    policy_freq[label] += 1
+                    freq[id_to_label[s]] += 1
 
-        for m in new_skills:
-            freq = policy_freq.get(m["ESCO_skill"], 1)
-            m["confidence"] = round(float(m["similarity"] * (1 + np.log1p(freq) / 10)), 3)
+        matches, high_conf = _compute_similarity(ESCO_skill_labels, non_ESCO_skills, similarity_threshold, confidence_threshold, freq, skill_source)
+        proposed = sorted({m["non_ESCO_skill"] for m in high_conf})
+        G, nodes, edges, net_stats = _build_network(high_conf)
 
-        high_conf_skills = [m for m in new_skills if m["confidence"] >= confidence_threshold]
-        proposed_extensions = sorted(set([m["non_ESCO_skill"] for m in high_conf_skills]))
-
-        print(f"🚀 {len(high_conf_skills)} high-confidence new skills proposed for ESCO+ extension.")
-
-        # === 7️⃣ Save Extended Taxonomy ===
         output_path = "ESCOplus_Extended_from_Courses.csv"
-        pd.DataFrame(high_conf_skills).to_csv(output_path, index=False)
-        print(f"💾 Extended taxonomy saved at {output_path}")
+        pd.DataFrame(high_conf).to_csv(output_path, index=False)
 
-        # === 🌐 Build Skill Network (ESCO ↔ non-ESCO from Jobs) ===
-        import networkx as nx
-
-        print("🌐 Building skill network from job-based matches...")
-        G = nx.Graph()
-
-        for m in high_conf_skills:
-            e, n = m["ESCO_skill"], m["non_ESCO_skill"]
-            G.add_node(e, group="ESCO_skill")
-            G.add_node(n, group="non_ESCO_skill")
-            G.add_edge(e, n, similarity=m["similarity"], confidence=m["confidence"])
-
-        # === 🧮 Compute Network Metrics ===
-        if G.number_of_edges() > 0:
-            raw_degree = dict(G.degree())
-            degree_centrality = {k: round(v, 3) for k, v in nx.degree_centrality(G).items()}
-            avg_similarity = np.mean([d["similarity"] for _, _, d in G.edges(data=True)])
-            clustering = round(nx.average_clustering(G), 3)
-            components = [len(c) for c in nx.connected_components(G)]
-            largest_component = max(components) if components else 0
-        else:
-            raw_degree, degree_centrality, avg_similarity, clustering, largest_component = {}, {}, 0, 0, 0
-
-        # === 🧩 Nodes and Edges ===
-        nodes = [
-            {
-                "id": n,
-                "group": G.nodes[n]["group"],
-                "degree": raw_degree.get(n, 0),
-                "degree_centrality": degree_centrality.get(n, 0)
-            }
-            for n in G.nodes()
-        ]
-
-        edges = [
-            {"source": u, "target": v, **d}
-            for u, v, d in G.edges(data=True)
-        ]
-
-        # === 📊 Group Degree Stats ===
-        esco_degrees = [n["degree"] for n in nodes if n["group"] == "ESCO_skill"]
-        non_esco_degrees = [n["degree"] for n in nodes if n["group"] == "non_ESCO_skill"]
-        group_degree_stats = {
-            "ESCO_avg_degree": round(np.mean(esco_degrees), 3) if esco_degrees else 0,
-            "non_ESCO_avg_degree": round(np.mean(non_esco_degrees), 3) if non_esco_degrees else 0
-        }
-
-        # === 🧠 Final Network Data Object ===
-        network_data = {
-            "nodes": nodes,
-            "edges": edges,
-            "stats": {
-                "nodes": G.number_of_nodes(),
-                "edges": G.number_of_edges(),
-                "avg_similarity": round(float(avg_similarity), 3),
-                "avg_clustering": clustering,
-                "largest_component_size": largest_component,
-                "avg_degree": round(np.mean(list(degree_centrality.values())), 3) if degree_centrality else 0,
-                **group_degree_stats
-            }
-        }
-
-        # === ✅ Return results ===
         return {
-            "message": "✅ ESCOPlus taxonomy successfully extended using course-derived skills.",
+            "message": "✅ ESCOPlus taxonomy extended from courses.",
             "summary": {
                 "Courses processed": len(all_courses),
                 "ESCO skills mapped": len(ESCO_skill_labels),
-                "Non-ESCO tech skills": len(non_ESCO_skills),
+                "Non-ESCO skill pool (CSV+AI+Green)": len(non_ESCO_skills),
                 "Matches found": len(matches),
-                "High-confidence new skills": len(high_conf_skills)
+                "High-confidence new skills": len(high_conf)
             },
-            "proposed_extensions": proposed_extensions[:100],
-            "new_skills_preview": high_conf_skills[:20],
+            "proposed_extensions": proposed[:100],
+            "new_skills_preview": high_conf[:20],
             "output_file": output_path,
-            "network": network_data
+            "network": {"nodes": nodes, "edges": edges, "stats": net_stats}
         }
-
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
-# === FORECASTING ENDPOINTS ===
+
+
+# ============================================================
+#  FORECASTING: /profiles  (unchanged logic)
+# ============================================================
+
 @forecast_router.get("/profiles")
 def profiles_link_prediction(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g. AI, data, education)"),
-    source: str = Query(None, description="Optional source filter for profiles (e.g. linkedin, eurofound)"),
-    similarity_threshold: float = Query(0.7, description="Minimum similarity to consider existing edges"),
-    top_k: int = Query(30, description="Number of top predicted links to return"),
-    method: str = Query("adamic_adar", description="Link prediction method: adamic_adar, resource_allocation, or jaccard")
+    keywords: str = Query(...),
+    source: str = Query(None),
+    similarity_threshold: float = Query(0.7),
+    top_k: int = Query(30),
+    method: str = Query("adamic_adar")
 ):
-    """
-    Predict new potential ESCO ↔ non-ESCO connections from user profiles using classical link prediction methods.
-    """
-    import os, requests, numpy as np, pandas as pd, traceback, networkx as nx
-    from dotenv import load_dotenv
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-
     try:
-        # === 1️⃣ Authenticate ===
-        load_dotenv()
-        API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-        USERNAME = os.getenv("TRACKER_USERNAME", "")
-        PASSWORD = os.getenv("TRACKER_PASSWORD", "")
-
-        print("🔐 Authenticating with Tracker...")
-        res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
-        res.raise_for_status()
-        token = res.text.replace('"', "")
+        print("🔐 Authenticating...")
+        token = _get_token()
         headers = {"Authorization": f"Bearer {token}"}
 
-        # === 2️⃣ Retrieve Profiles ===
         keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
         payload = {"keywords": keywords_list, "keywords_logic": "or"}
         if source:
@@ -1090,59 +945,26 @@ def profiles_link_prediction(
 
         all_profiles = []
         for page in range(1, 51):
-            url = f"{API}/profiles?page={page}&page_size=100"
+            url = f"{os.getenv('TRACKER_API')}/profiles?page={page}&page_size=100"
             res = requests.post(url, headers=headers, data=payload, timeout=60)
             if res.status_code != 200:
                 break
-            data = res.json()
-            items = data.get("items", [])
+            items = res.json().get("items", [])
             if not items:
                 break
             all_profiles.extend(items)
             if len(items) < 100:
                 break
         print(f"📄 Retrieved {len(all_profiles)} profiles.")
-
         if not all_profiles:
-            return {"error": "No profiles found for given filters."}
+            return {"error": "No profiles found."}
 
-        # === 3️⃣ Extract ESCO Skills ===
-        skill_uris = [s for d in all_profiles for s in d.get("skills", []) if isinstance(s, str) and s.startswith("http")]
-        unique_uris = sorted(set(skill_uris))
+        skill_uris = sorted(set(s for d in all_profiles for s in d.get("skills", []) if isinstance(s, str) and s.startswith("http")))
+        id_to_label = _batch_resolve_skills(headers, skill_uris)
+        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in skill_uris})
 
-        # Map URIs → ESCO Labels
-        id_to_label = {}
-        all_esco = []
-        for page in range(1, 51):
-            r = requests.post(f"{API}/skills?page={page}&page_size=100", headers=headers, timeout=30)
-            if r.status_code != 200:
-                break
-            items = r.json().get("items", [])
-            if not items:
-                break
-            all_esco.extend(items)
-            if len(items) < 100:
-                break
-        for s in all_esco:
-            sid = s.get("id")
-            label = s.get("label", "").strip().lower()
-            if sid and label:
-                id_to_label[sid] = label
-        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in unique_uris})
-        print(f"🧠 {len(ESCO_skill_labels)} unique ESCO skills mapped.")
+        non_ESCO_skills, skill_source = _load_non_esco_skills()
 
-        # === 4️⃣ Load Non-ESCO Skills CSV ===
-        csv_path = "technology_skills.csv"
-        tech_df = pd.read_csv(csv_path, sep=None, engine="python", on_bad_lines="skip")
-        if "Example" not in tech_df.columns:
-            return {"error": "CSV must contain an 'Example' column."}
-        tech_examples = []
-        for row in tech_df["Example"].dropna().astype(str):
-            tech_examples.extend([s.strip().lower() for s in row.replace(";", ",").split(",") if s.strip()])
-        non_ESCO_skills = sorted(set(tech_examples))
-        print(f"💾 Loaded {len(non_ESCO_skills)} technology (non-ESCO) skills.")
-
-        # === 5️⃣ Build Graph Based on TF-IDF Similarity ===
         corpus = list(ESCO_skill_labels) + list(non_ESCO_skills)
         vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4))
         tfidf = vectorizer.fit_transform(corpus)
@@ -1155,12 +977,10 @@ def profiles_link_prediction(
                 if sim >= similarity_threshold:
                     G.add_edge(esco_skill, non_esco_skill, weight=sim)
 
-        print(f"🕸️ Graph built with {len(G.nodes())} nodes and {len(G.edges())} edges.")
-
+        print(f"🕸️ Graph: {len(G.nodes())} nodes, {len(G.edges())} edges.")
         if G.number_of_edges() == 0:
             return {"error": "No edges found. Try lowering similarity_threshold."}
 
-        # === 6️⃣ Link Prediction Method ===
         if method == "adamic_adar":
             preds = nx.adamic_adar_index(G)
         elif method == "resource_allocation":
@@ -1169,48 +989,26 @@ def profiles_link_prediction(
             preds = nx.jaccard_coefficient(G)
 
         preds_sorted = sorted(preds, key=lambda x: x[2], reverse=True)[:top_k]
-
-        # === 7️⃣ Add Weighted Adjustment + Emoji Confidence ===
         candidate_links = []
         for u, v, score in preds_sorted:
-            # Weighted adjustment using existing edge weights
-            common_neighbors = list(nx.common_neighbors(G, u, v))
-            weighted_score = np.mean([G[u][n]["weight"] * G[v][n]["weight"] for n in common_neighbors]) if common_neighbors else 0
-            combined_score = round((score + weighted_score) / 2, 3)
+            common = list(nx.common_neighbors(G, u, v))
+            ws = np.mean([G[u][n]["weight"] * G[v][n]["weight"] for n in common]) if common else 0
+            combined = round((score + ws) / 2, 3)
+            emoji, level = ("🟢", "High confidence") if combined >= 0.8 else (("🟡", "Medium confidence") if combined >= 0.6 else ("🔴", "Low confidence"))
+            candidate_links.append({"source": u, "target": v, "predicted_score": combined, "confidence_level": level, "emoji": emoji})
 
-            # Emoji and confidence level
-            if combined_score >= 0.8:
-                emoji = "🟢"
-                level = "High confidence"
-            elif combined_score >= 0.6:
-                emoji = "🟡"
-                level = "Medium confidence"
-            else:
-                emoji = "🔴"
-                level = "Low confidence"
-
-            candidate_links.append({
-                "source": u,
-                "target": v,
-                "predicted_score": combined_score,
-                "confidence_level": level,
-                "emoji": emoji
-            })
-
-        # === 8️⃣ Build Summary ===
         summary_counts = {
             "high": sum(1 for c in candidate_links if c["predicted_score"] >= 0.8),
             "medium": sum(1 for c in candidate_links if 0.6 <= c["predicted_score"] < 0.8),
             "low": sum(1 for c in candidate_links if c["predicted_score"] < 0.6)
         }
 
-        # === 9️⃣ Return Response ===
         return {
             "message": "✅ ESCOPlus classical link prediction completed.",
             "summary": {
                 "Profiles processed": len(all_profiles),
                 "Mapped ESCO skills": len(ESCO_skill_labels),
-                "Non-ESCO skills": len(non_ESCO_skills),
+                "Non-ESCO skill pool (CSV+AI+Green)": len(non_ESCO_skills),
                 "Observed edges": len(G.edges()),
                 "Predicted new links": len(candidate_links),
                 "Method used": method,
@@ -1218,138 +1016,238 @@ def profiles_link_prediction(
             },
             "predicted_links": candidate_links
         }
-
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
 
+# ============================================================
+#  FORECASTING: /ku-link-prediction  (unchanged logic)
+# ============================================================
+
+@forecast_router.get("/ku-link-prediction")
+def ku_link_prediction(
+    start_date: str = Query(None),
+    end_date: str = Query(None),
+    kus: str = Query(None),
+    organization: str = Query(None),
+    max_edges: int = Query(100),
+    max_nodes: int = Query(200),
+    top_k: int = Query(30),
+    method: str = Query("adamic_adar")
+):
+    try:
+        BASE_URL = os.getenv("KU_API_URL", "").rstrip("/")
+        api_url = f"{BASE_URL}/analysis_results"
+        params = {k: v for k, v in [("start_date", start_date), ("end_date", end_date), ("organization", organization)] if v}
+
+        print(f"🔍 Fetching KU data from {api_url} with {params}")
+        response = requests.get(api_url, params=params, timeout=90)
+        response.raise_for_status()
+        ku_data = response.json()
+
+        if not ku_data:
+            return {"error": "No KU data found."}
+        print(f"✅ Retrieved {len(ku_data)} KU records.")
+
+        selected_kus = set(kus.split(",")) if kus else None
+        ku_docs = []
+        for record in ku_data:
+            detected_kus = record.get("detected_kus", {})
+            org = record.get("organization", "Unknown")
+            timestamp = record.get("timestamp", "")
+            if organization and org.lower() != organization.lower():
+                continue
+            active_kus = [ku for ku, val in detected_kus.items() if str(val) == "1"]
+            if selected_kus:
+                active_kus = [ku for ku in active_kus if ku in selected_kus]
+            if active_kus:
+                ku_docs.append({"organization": org, "timestamp": timestamp, "kus": active_kus})
+
+        print(f"📊 Documents with active KUs: {len(ku_docs)}")
+        if not ku_docs:
+            return {"message": "No KU detections found."}
+
+        co_counts = defaultdict(int)
+        ku_counts = defaultdict(int)
+        for doc in ku_docs:
+            for ku in set(doc["kus"]):
+                ku_counts[ku] += 1
+            for ku1, ku2 in combinations(sorted(set(doc["kus"])), 2):
+                co_counts[(ku1, ku2)] += 1
+
+        print("\n📈 Top 20 KUs:")
+        for ku, count in sorted(ku_counts.items(), key=lambda x: x[1], reverse=True)[:20]:
+            print(f"   {ku}: {count}")
+
+        edges = []
+        for (ku1, ku2), cij in co_counts.items():
+            ci, cj = ku_counts[ku1], ku_counts[ku2]
+            if ci > 0 and cj > 0:
+                edges.append({"source": ku1, "target": ku2, "value": round((cij**2) / (ci * cj), 4), "raw_count": cij})
+
+        if not edges:
+            return {"message": "No co-occurrence edges found."}
+        edges = sorted(edges, key=lambda x: x["value"], reverse=True)[:max_edges]
+
+        G = nx.Graph()
+        for e in edges:
+            G.add_edge(e["source"], e["target"], weight=e["value"])
+        if G.number_of_nodes() > max_nodes:
+            top_nodes = sorted(G.degree, key=lambda x: x[1], reverse=True)[:max_nodes]
+            G = G.subgraph({n for n, _ in top_nodes}).copy()
+
+        if G.number_of_nodes() == 0:
+            return {"message": "No network could be built."}
+
+        density = nx.density(G)
+        avg_deg = float(np.mean([d for _, d in G.degree()]))
+        print(f"\n🧮 Network → Nodes: {G.number_of_nodes()}, Edges: {G.number_of_edges()}, Density: {density:.6f}")
+
+        GC = max(nx.connected_components(G), key=len)
+        subG = G.subgraph(GC).copy()
+        print(f"🕸️ Giant Component: {len(subG.nodes())} nodes, {len(subG.edges())} edges")
+
+        if density < 0.001 and method in ["adamic_adar", "resource_allocation", "jaccard"]:
+            print("⚠️ Sparse graph — switching to preferential_attachment")
+            method = "preferential_attachment"
+
+        if method == "adamic_adar":
+            preds = nx.adamic_adar_index(subG)
+        elif method == "resource_allocation":
+            preds = nx.resource_allocation_index(subG)
+        elif method == "jaccard":
+            preds = nx.jaccard_coefficient(subG)
+        else:
+            preds = nx.preferential_attachment(subG)
+
+        preds_sorted = sorted(preds, key=lambda x: x[2], reverse=True)[:top_k]
+        candidate_links = []
+        for u, v, score in preds_sorted:
+            common = list(nx.common_neighbors(subG, u, v))
+            ws = np.mean([subG[u][n]["weight"] * subG[v][n]["weight"] for n in common]) if common else 0
+            combined = round((score + ws) / 2, 3)
+            emoji, level = ("🟢", "High confidence") if combined >= 0.8 else (("🟡", "Medium confidence") if combined >= 0.6 else ("🔴", "Low confidence"))
+            candidate_links.append({"source": u, "target": v, "predicted_score": combined, "confidence_level": level, "emoji": emoji})
+
+        summary_counts = {
+            "high": sum(1 for c in candidate_links if c["predicted_score"] >= 0.8),
+            "medium": sum(1 for c in candidate_links if 0.6 <= c["predicted_score"] < 0.8),
+            "low": sum(1 for c in candidate_links if c["predicted_score"] < 0.6)
+        }
+
+        return {
+            "message": "✅ KU link prediction completed.",
+            "summary": {
+                "Total KU Records": len(ku_data), "Documents with KUs": len(ku_docs),
+                "Unique KUs": len(ku_counts), "Observed Edges": len(subG.edges()),
+                "Predicted New Links": len(candidate_links), "Density": round(density, 6),
+                "Average Degree": round(avg_deg, 3), "Method Used": method,
+                "Confidence Distribution": summary_counts
+            },
+            "predicted_links": candidate_links
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": f"KU link prediction failed: {str(e)}"}
+
+
+# ============================================================
+#  FORECASTING: /jobsd-forecast
+#  ✅ MODIFIED: occupation_ids filter + auto-pagination + cache
+# ============================================================
 
 @forecast_router.get("/jobsd-forecast")
 def jobs_link_prediction(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g. AI, data, software)"),
-    source: str = Query(None, description="Optional source filter (e.g. linkedin, indeed)"),
-    min_upload_date: str = Query(None, description="Minimum upload date (YYYY-MM-DD)"),
-    max_upload_date: str = Query(None, description="Maximum upload date (YYYY-MM-DD)"),
-    similarity_threshold: float = Query(0.7, description="Minimum similarity to consider edges"),
-    top_k: int = Query(30, description="Number of top predicted links to return"),
-    method: str = Query("adamic_adar", description="Link prediction method: adamic_adar, resource_allocation, or jaccard"),
-    max_pages: int = Query(10, description="Maximum number of pages to fetch (each page = 100 jobs)")
+    keywords: Optional[str] = Query(None, description="Comma-separated keywords"),
+    occupation_ids: Optional[str] = Query(None, description="Comma-separated occupation IDs"),
+    source: Optional[str] = Query(None),
+    min_upload_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    max_upload_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    similarity_threshold: float = Query(0.7),
+    top_k: int = Query(30),
+    method: str = Query("adamic_adar"),
 ):
     """
-    Predict new potential ESCO ↔ non-ESCO connections using job-related ESCO skills
-    and technology skills from CSV via classical link prediction methods.
+    Predict new ESCO ↔ non-ESCO connections from job postings.
+    Supports occupation_ids filtering, auto-paginates all pages with retry,
+    results cached in Completed_Analyses/.
     """
-    import os, requests, numpy as np, pandas as pd, traceback, networkx as nx
-    from dotenv import load_dotenv
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-
     try:
-        # === 1️⃣ Authenticate ===
-        load_dotenv()
-        API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-        USERNAME = os.getenv("TRACKER_USERNAME", "")
-        PASSWORD = os.getenv("TRACKER_PASSWORD", "")
 
-        print("🔐 Authenticating with Tracker...")
-        res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
-        res.raise_for_status()
-        token = res.text.replace('"', "")
-        headers = {"Authorization": f"Bearer {token}"}
+        # === Cache ===
+        folder = _ensure_cache_folder()
+        keywords_list = [k.strip() for k in keywords.split(",") if k.strip()] if keywords else []
+        occ_ids_list = [o.strip() for o in occupation_ids.split(",") if o.strip()] if occupation_ids else []
 
-        # === 2️⃣ Retrieve Job Postings ===
-        keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
-        all_jobs = []
-        for page in range(1, max_pages + 1):
-            form_data = [
-                ("keywords_logic", "or"),
-                ("skill_ids_logic", "or"),
-                ("occupation_ids_logic", "or")
-            ]
+        filename = f"completed_analysis_jobs_forecast_{method}"
+        for kw in keywords_list:
+            filename += f"_{kw}"
+        for occ in occ_ids_list:
+            filename += f"_{_occ_code(occ)}"
+        if source:
+            filename += f"_{source}"
+        if min_upload_date:
+            filename += f"_from{min_upload_date}"
+        if max_upload_date:
+            filename += f"_to{max_upload_date}"
+        filename += f"_sim{similarity_threshold}_topk{top_k}.json"
+
+        file_path = folder / filename
+        print(f"🗂️ Cache path: {file_path}")
+        if file_path.exists():
+            print(f"✅ Cache hit — loading from '{file_path}'.")
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    cached = json.loads(f.read())
+                return cached
+            except (json.JSONDecodeError, ValueError) as cache_err:
+                print(f"⚠️ Cache file is corrupted ({cache_err}) — deleting and re-running...")
+                file_path.unlink()
+
+        print("🌐 No cache — running full analysis...")
+        print("🔐 Authenticating...")
+        token = _get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        }
+        print("✅ Authenticated.")
+        print(f"📡 Keywords: {keywords_list or '(none)'} | OccupationIDs: {occ_ids_list or '(none)'}")
+
+        def build_form():
+            fd = [("keywords_logic", "or"), ("skill_ids_logic", "or"), ("occupation_ids_logic", "or")]
             for kw in keywords_list:
-                form_data.append(("keywords", kw))
+                fd.append(("keywords", kw))
+            for occ in occ_ids_list:
+                fd.append(("occupation_ids", occ))
             if source:
-                form_data.append(("sources", source))
+                fd.append(("sources", source))
             if min_upload_date:
-                form_data.append(("min_upload_date", min_upload_date))
+                fd.append(("min_upload_date", min_upload_date))
             if max_upload_date:
-                form_data.append(("max_upload_date", max_upload_date))
+                fd.append(("max_upload_date", max_upload_date))
+            return fd
 
-            url = f"{API}/jobs?page={page}&page_size=100"
-            res = requests.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json"
-                },
-                data=form_data,
-                timeout=90
-            )
-            if res.status_code != 200:
-                print(f"⚠️ Page {page}: HTTP {res.status_code}")
-                break
-            data = res.json()
-            items = data.get("items", [])
-            if not items:
-                break
-            all_jobs.extend(items)
-            if len(items) < 100:
-                break
-
-        print(f"🎯 Total job postings retrieved: {len(all_jobs)}")
+        all_jobs, total_count = _auto_paginate("jobs", headers, build_form)
         if not all_jobs:
             return {"error": "No job postings found for the given filters."}
 
-        # === 3️⃣ Extract ESCO Skills ===
-        print("🧩 Extracting ESCO skill URIs from jobs...")
-        skill_uris = []
-        for job in all_jobs:
-            skill_uris.extend([s for s in job.get("skills", []) if isinstance(s, str) and s.startswith("http")])
-        unique_uris = sorted(set(skill_uris))
-        print(f"🔗 Found {len(unique_uris)} unique skill URIs.")
+        skill_uris = sorted(set(s for j in all_jobs for s in j.get("skills", []) if isinstance(s, str) and s.startswith("http")))
+        id_to_label = _batch_resolve_skills(headers, skill_uris)
+        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in skill_uris})
+        print(f"🧠 {len(ESCO_skill_labels)} ESCO skills from jobs.")
 
-        # Map URIs → ESCO Labels
-        id_to_label = {}
-        all_esco = []
-        for page in range(1, 51):
-            r = requests.post(f"{API}/skills?page={page}&page_size=100", headers=headers, timeout=30)
-            if r.status_code != 200:
-                break
-            items = r.json().get("items", [])
-            if not items:
-                break
-            all_esco.extend(items)
-            if len(items) < 100:
-                break
+        non_ESCO_skills, skill_source = _load_non_esco_skills()
+        print(f"💾 {len(non_ESCO_skills)} non-ESCO skills.")
 
-        for s in all_esco:
-            sid = s.get("id")
-            label = s.get("label", "").strip().lower()
-            if sid and label:
-                id_to_label[sid] = label
-
-        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in unique_uris})
-        print(f"🧠 {len(ESCO_skill_labels)} unique ESCO skills mapped from jobs.")
-
-        # === 4️⃣ Load Non-ESCO (Tech) Skills CSV ===
-        csv_path = "technology_skills.csv"
-        tech_df = pd.read_csv(csv_path, sep=None, engine="python", on_bad_lines="skip")
-        if "Example" not in tech_df.columns:
-            return {"error": "CSV must contain an 'Example' column."}
-        tech_examples = []
-        for row in tech_df["Example"].dropna().astype(str):
-            tech_examples.extend([s.strip().lower() for s in row.replace(";", ",").split(",") if s.strip()])
-        non_ESCO_skills = sorted(set(tech_examples))
-        print(f"💾 Loaded {len(non_ESCO_skills)} technology (non-ESCO) skills.")
-
-        # === 5️⃣ Build Graph via TF-IDF Similarity ===
         corpus = list(ESCO_skill_labels) + list(non_ESCO_skills)
         vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4))
         tfidf = vectorizer.fit_transform(corpus)
         sim_matrix = cosine_similarity(tfidf[:len(ESCO_skill_labels)], tfidf[len(ESCO_skill_labels):])
 
+        print(f"🕸️ Building similarity graph (threshold={similarity_threshold})...")
         G = nx.Graph()
         for i, esco_skill in enumerate(ESCO_skill_labels):
             for j, tech_skill in enumerate(non_ESCO_skills):
@@ -1357,11 +1255,11 @@ def jobs_link_prediction(
                 if sim >= similarity_threshold:
                     G.add_edge(esco_skill, tech_skill, weight=sim)
 
-        print(f"🕸️ Graph built with {len(G.nodes())} nodes and {len(G.edges())} edges.")
+        print(f"🕸️ Graph: {len(G.nodes())} nodes, {len(G.edges())} edges.")
         if G.number_of_edges() == 0:
             return {"error": "No edges found. Try lowering similarity_threshold."}
 
-        # === 6️⃣ Classical Link Prediction ===
+        print(f"🔮 Running link prediction: {method}")
         if method == "adamic_adar":
             preds = nx.adamic_adar_index(G)
         elif method == "resource_allocation":
@@ -1370,46 +1268,34 @@ def jobs_link_prediction(
             preds = nx.jaccard_coefficient(G)
 
         preds_sorted = sorted(preds, key=lambda x: x[2], reverse=True)[:top_k]
-
-        # === 7️⃣ Combine Scores + Emoji Confidence ===
         candidate_links = []
         for u, v, score in preds_sorted:
-            common_neighbors = list(nx.common_neighbors(G, u, v))
-            weighted_score = np.mean([G[u][n]["weight"] * G[v][n]["weight"] for n in common_neighbors]) if common_neighbors else 0
-            combined_score = round((score + weighted_score) / 2, 3)
+            common = list(nx.common_neighbors(G, u, v))
+            ws = np.mean([G[u][n]["weight"] * G[v][n]["weight"] for n in common]) if common else 0
+            combined = round((score + ws) / 2, 3)
+            emoji, level = ("🟢", "High confidence") if combined >= 0.8 else (("🟡", "Medium confidence") if combined >= 0.6 else ("🔴", "Low confidence"))
+            candidate_links.append({"source": u, "target": v, "predicted_score": combined, "confidence_level": level, "emoji": emoji})
 
-            if combined_score >= 0.8:
-                emoji = "🟢"
-                level = "High confidence"
-            elif combined_score >= 0.6:
-                emoji = "🟡"
-                level = "Medium confidence"
-            else:
-                emoji = "🔴"
-                level = "Low confidence"
-
-            candidate_links.append({
-                "source": u,
-                "target": v,
-                "predicted_score": combined_score,
-                "confidence_level": level,
-                "emoji": emoji
-            })
-
-        # === 8️⃣ Summary ===
         summary_counts = {
             "high": sum(1 for c in candidate_links if c["predicted_score"] >= 0.8),
             "medium": sum(1 for c in candidate_links if 0.6 <= c["predicted_score"] < 0.8),
             "low": sum(1 for c in candidate_links if c["predicted_score"] < 0.6)
         }
 
-        # === 9️⃣ Return Response ===
-        return {
+        result = {
             "message": "✅ ESCOPlus job-based link prediction completed.",
+            "filters_used": {
+                "keywords": keywords_list or None,
+                "occupation_ids": occ_ids_list or None,
+                "source": source,
+                "min_upload_date": min_upload_date,
+                "max_upload_date": max_upload_date,
+            },
             "summary": {
                 "Jobs processed": len(all_jobs),
+                "Total jobs available": total_count,
                 "Mapped ESCO skills": len(ESCO_skill_labels),
-                "Non-ESCO skills": len(non_ESCO_skills),
+                "Non-ESCO skill pool (CSV+AI+Green)": len(non_ESCO_skills),
                 "Observed edges": len(G.edges()),
                 "Predicted new links": len(candidate_links),
                 "Method used": method,
@@ -1418,101 +1304,59 @@ def jobs_link_prediction(
             "predicted_links": candidate_links
         }
 
+        result = _sanitize(result)
+        print(f"💾 Saving to cache: '{file_path}'...")
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(_safe_json_dumps(result))
+        print(f"✅ Cached.")
+        return result
+
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
+
+# ============================================================
+#  FORECASTING: /courses  (unchanged logic)
+# ============================================================
+
 @forecast_router.get("/courses")
 def courses_link_prediction(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g. data, ai, green)"),
-    source: str = Query(None, description="Optional source filter (e.g. Udacity, europass)"),
-    similarity_threshold: float = Query(0.7, description="Minimum similarity to consider edges"),
-    top_k: int = Query(30, description="Number of top predicted links to return"),
-    method: str = Query("adamic_adar", description="Link prediction method: adamic_adar, resource_allocation, or jaccard")
+    keywords: str = Query(...),
+    source: str = Query("coursera"),
+    similarity_threshold: float = Query(0.7),
+    top_k: int = Query(30),
+    method: str = Query("adamic_adar")
 ):
-    """
-    Predict new potential ESCO ↔ non-ESCO connections using course-related ESCO skills
-    and technology skills from CSV, via classical link prediction methods.
-    """
-    import os, requests, numpy as np, pandas as pd, traceback, networkx as nx
-    from dotenv import load_dotenv
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-
     try:
-        # === 1️⃣ Authenticate ===
-        load_dotenv()
-        API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-        USERNAME = os.getenv("TRACKER_USERNAME", "")
-        PASSWORD = os.getenv("TRACKER_PASSWORD", "")
-
-        print("🔐 Authenticating with Tracker...")
-        res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
-        res.raise_for_status()
-        token = res.text.replace('"', "")
+        print("🔐 Authenticating...")
+        token = _get_token()
         headers = {"Authorization": f"Bearer {token}"}
 
-        # === 2️⃣ Retrieve Courses ===
         keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
         payload = {"keywords": keywords_list, "keywords_logic": "or", "sources": [source]}
         all_courses = []
-
         for page in range(1, 51):
-            url = f"{API}/courses?page={page}&page_size=100"
+            url = f"{os.getenv('TRACKER_API')}/courses?page={page}&page_size=100"
             res = requests.post(url, headers=headers, data=payload, timeout=60)
             if res.status_code != 200:
                 break
-            data = res.json()
-            items = data.get("items", [])
+            items = res.json().get("items", [])
             if not items:
                 break
             all_courses.extend(items)
             if len(items) < 100:
                 break
-
         print(f"📄 Retrieved {len(all_courses)} courses.")
         if not all_courses:
-            return {"error": "No courses found for given filters."}
+            return {"error": "No courses found."}
 
-        # === 3️⃣ Extract ESCO Skills ===
-        skill_uris = [s for d in all_courses for s in d.get("skills", []) if isinstance(s, str) and s.startswith("http")]
-        unique_uris = sorted(set(skill_uris))
+        skill_uris = sorted(set(s for d in all_courses for s in d.get("skills", []) if isinstance(s, str) and s.startswith("http")))
+        id_to_label = _batch_resolve_skills(headers, skill_uris)
+        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in skill_uris})
 
-        # Map URIs → ESCO Labels
-        id_to_label = {}
-        all_esco = []
-        for page in range(1, 51):
-            r = requests.post(f"{API}/skills?page={page}&page_size=100", headers=headers, timeout=30)
-            if r.status_code != 200:
-                break
-            items = r.json().get("items", [])
-            if not items:
-                break
-            all_esco.extend(items)
-            if len(items) < 100:
-                break
+        non_ESCO_skills, skill_source = _load_non_esco_skills()
 
-        for s in all_esco:
-            sid = s.get("id")
-            label = s.get("label", "").strip().lower()
-            if sid and label:
-                id_to_label[sid] = label
-
-        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in unique_uris})
-        print(f"🧠 {len(ESCO_skill_labels)} unique ESCO skills mapped from courses.")
-
-        # === 4️⃣ Load Non-ESCO (Tech) Skills ===
-        csv_path = "technology_skills.csv"
-        tech_df = pd.read_csv(csv_path, sep=None, engine="python", on_bad_lines="skip")
-        if "Example" not in tech_df.columns:
-            return {"error": "CSV must contain an 'Example' column."}
-        tech_examples = []
-        for row in tech_df["Example"].dropna().astype(str):
-            tech_examples.extend([s.strip().lower() for s in row.replace(";", ",").split(",") if s.strip()])
-        non_ESCO_skills = sorted(set(tech_examples))
-        print(f"💾 Loaded {len(non_ESCO_skills)} non-ESCO (technology) skills.")
-
-        # === 5️⃣ Build Graph via TF-IDF Similarity ===
         corpus = list(ESCO_skill_labels) + list(non_ESCO_skills)
         vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4))
         tfidf = vectorizer.fit_transform(corpus)
@@ -1525,12 +1369,10 @@ def courses_link_prediction(
                 if sim >= similarity_threshold:
                     G.add_edge(esco_skill, tech_skill, weight=sim)
 
-        print(f"🕸️ Graph built with {len(G.nodes())} nodes and {len(G.edges())} edges.")
-
+        print(f"🕸️ Graph: {len(G.nodes())} nodes, {len(G.edges())} edges.")
         if G.number_of_edges() == 0:
-            return {"error": "No edges found. Try lowering similarity_threshold."}
+            return {"error": "No edges found."}
 
-        # === 6️⃣ Classical Link Prediction ===
         if method == "adamic_adar":
             preds = nx.adamic_adar_index(G)
         elif method == "resource_allocation":
@@ -1539,101 +1381,61 @@ def courses_link_prediction(
             preds = nx.jaccard_coefficient(G)
 
         preds_sorted = sorted(preds, key=lambda x: x[2], reverse=True)[:top_k]
-
-        # === 7️⃣ Combine Scores + Add Emoji Confidence ===
         candidate_links = []
         for u, v, score in preds_sorted:
-            common_neighbors = list(nx.common_neighbors(G, u, v))
-            weighted_score = np.mean([G[u][n]["weight"] * G[v][n]["weight"] for n in common_neighbors]) if common_neighbors else 0
-            combined_score = round((score + weighted_score) / 2, 3)
+            common = list(nx.common_neighbors(G, u, v))
+            ws = np.mean([G[u][n]["weight"] * G[v][n]["weight"] for n in common]) if common else 0
+            combined = round((score + ws) / 2, 3)
+            emoji, level = ("🟢", "High confidence") if combined >= 0.8 else (("🟡", "Medium confidence") if combined >= 0.6 else ("🔴", "Low confidence"))
+            candidate_links.append({"source": u, "target": v, "predicted_score": combined, "confidence_level": level, "emoji": emoji})
 
-            if combined_score >= 0.8:
-                emoji = "🟢"
-                level = "High confidence"
-            elif combined_score >= 0.6:
-                emoji = "🟡"
-                level = "Medium confidence"
-            else:
-                emoji = "🔴"
-                level = "Low confidence"
-
-            candidate_links.append({
-                "source": u,
-                "target": v,
-                "predicted_score": combined_score,
-                "confidence_level": level,
-                "emoji": emoji
-            })
-
-        # === 8️⃣ Summary ===
         summary_counts = {
             "high": sum(1 for c in candidate_links if c["predicted_score"] >= 0.8),
             "medium": sum(1 for c in candidate_links if 0.6 <= c["predicted_score"] < 0.8),
             "low": sum(1 for c in candidate_links if c["predicted_score"] < 0.6)
         }
 
-        # === 9️⃣ Return Response ===
         return {
             "message": "✅ ESCOPlus course-based link prediction completed.",
             "summary": {
-                "Courses processed": len(all_courses),
-                "Mapped ESCO skills": len(ESCO_skill_labels),
-                "Non-ESCO skills": len(non_ESCO_skills),
-                "Observed edges": len(G.edges()),
-                "Predicted new links": len(candidate_links),
-                "Method used": method,
+                "Courses processed": len(all_courses), "Mapped ESCO skills": len(ESCO_skill_labels),
+                "Non-ESCO skill pool (CSV+AI+Green)": len(non_ESCO_skills), "Observed edges": len(G.edges()),
+                "Predicted new links": len(candidate_links), "Method used": method,
                 "Confidence distribution": summary_counts
             },
             "predicted_links": candidate_links
         }
-
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
+
+# ============================================================
+#  FORECASTING: /law_predict  (unchanged logic)
+# ============================================================
+
 @forecast_router.get("/law_predict")
 def law_policies_link_prediction(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g. data,ai,green)"),
-    source: str = Query("eur_lex", description="Source of the policies"),
-    similarity_threshold: float = Query(0.7, description="Minimum similarity to consider edges"),
-    top_k: int = Query(30, description="Number of top predicted links to return"),
-    method: str = Query("jaccard", description="Link prediction method: jaccard | adamic_adar | resource_allocation")
+    keywords: str = Query(...),
+    source: str = Query("eur_lex"),
+    similarity_threshold: float = Query(0.7),
+    top_k: int = Query(30),
+    method: str = Query("jaccard")
 ):
-    """
-    Extend the ESCO taxonomy using policy-linked ESCO skills and non-ESCO technology skills.
-    Predict new potential ESCO ↔ non-ESCO connections using classical link prediction methods.
-    """
-
-    import os, requests, pandas as pd, numpy as np, networkx as nx, traceback
-    from dotenv import load_dotenv
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-
     try:
-        # === 1️⃣ Authenticate ===
-        load_dotenv()
-        API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
-        USERNAME = os.getenv("TRACKER_USERNAME", "")
-        PASSWORD = os.getenv("TRACKER_PASSWORD", "")
-
-        print("🔐 Authenticating with Tracker...")
-        res = requests.post(f"{API}/login", json={"username": USERNAME, "password": PASSWORD}, timeout=15)
-        res.raise_for_status()
-        token = res.text.replace('"', "")
+        print("🔐 Authenticating...")
+        token = _get_token()
         headers = {"Authorization": f"Bearer {token}"}
-        print("✅ Authenticated.")
 
-        # === 2️⃣ Retrieve Policies ===
         keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
         payload = {"keywords": keywords_list, "keywords_logic": "or", "sources": [source]}
         all_docs = []
         for page in range(1, 51):
-            url = f"{API}/law-policies?page={page}&page_size=100"
+            url = f"{os.getenv('TRACKER_API')}/law-policies?page={page}&page_size=100"
             res = requests.post(url, headers=headers, data=payload, timeout=60)
             if res.status_code != 200:
                 break
-            data = res.json()
-            items = data.get("items", [])
+            items = res.json().get("items", [])
             if not items:
                 break
             all_docs.extend(items)
@@ -1641,131 +1443,65 @@ def law_policies_link_prediction(
                 break
         print(f"📄 Retrieved {len(all_docs)} policy documents.")
 
-        # === 3️⃣ Extract and Map ESCO Skills ===
-        skill_uris = [s for d in all_docs for s in d.get("skills", []) if isinstance(s, str) and s.startswith("http")]
-        unique_uris = sorted(set(skill_uris))
+        skill_uris = sorted(set(s for d in all_docs for s in d.get("skills", []) if isinstance(s, str) and s.startswith("http")))
+        id_to_label = _batch_resolve_skills(headers, skill_uris)
+        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in skill_uris})
+        print(f"🧠 {len(ESCO_skill_labels)} ESCO skills.")
 
-        id_to_label = {}
-        all_esco = []
-        for page in range(1, 51):
-            r = requests.post(f"{API}/skills?page={page}&page_size=100", headers=headers, timeout=30)
-            if r.status_code != 200:
-                break
-            items = r.json().get("items", [])
-            if not items:
-                break
-            all_esco.extend(items)
-            if len(items) < 100:
-                break
-        for s in all_esco:
-            sid = s.get("id")
-            label = s.get("label", "").strip().lower()
-            if sid and label:
-                id_to_label[sid] = label
+        non_ESCO_skills, skill_source = _load_non_esco_skills()
 
-        ESCO_skill_labels = sorted({id_to_label.get(u, u) for u in unique_uris})
-        print(f"🧠 {len(ESCO_skill_labels)} ESCO skills mapped.")
-
-        # === 4️⃣ Load Non-ESCO Skills ===
-        csv_path = "technology_skills.csv"
-        tech_df = pd.read_csv(csv_path, sep=None, engine="python", on_bad_lines="skip")
-
-        if "Example" not in tech_df.columns:
-            return {"error": "CSV must contain an 'Example' column."}
-
-        tech_examples = []
-        for row in tech_df["Example"].dropna().astype(str):
-            tech_examples.extend([s.strip().lower() for s in row.replace(";", ",").split(",") if s.strip()])
-        non_ESCO_skills = sorted(set(tech_examples))
-        print(f"💾 Loaded {len(non_ESCO_skills)} non-ESCO (technology) skills.")
-
-        # === 5️⃣ Build Graph by Similarity ===
         corpus = list(ESCO_skill_labels) + list(non_ESCO_skills)
         vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4))
         tfidf = vectorizer.fit_transform(corpus)
         sim_matrix = cosine_similarity(tfidf[:len(ESCO_skill_labels)], tfidf[len(ESCO_skill_labels):])
 
-        edges, weights = [], []
+        G = nx.Graph()
         for i, esco in enumerate(ESCO_skill_labels):
             for j, non_esco in enumerate(non_ESCO_skills):
                 sim = sim_matrix[i, j]
                 if sim >= similarity_threshold:
-                    edges.append((esco, non_esco))
-                    weights.append(sim)
+                    G.add_edge(esco, non_esco, weight=sim)
 
-        G = nx.Graph()
-        for (s, t), w in zip(edges, weights):
-            G.add_edge(s, t, weight=w)
-        print(f"🕸️ Graph built: {len(G.nodes())} nodes, {len(G.edges())} edges")
+        print(f"🕸️ Graph: {len(G.nodes())} nodes, {len(G.edges())} edges.")
 
-        # === 6️⃣ Predict New Links with Weighted Adjustment ===
-        print(f"🔮 Using link prediction method: {method}")
         if method == "adamic_adar":
             preds = nx.adamic_adar_index(G)
         elif method == "resource_allocation":
             preds = nx.resource_allocation_index(G)
-        else:  # default = jaccard
+        else:
             preds = nx.jaccard_coefficient(G)
 
         adjusted_preds = []
         for u, v, score in preds:
-            common_neighbors = list(nx.common_neighbors(G, u, v))
-            if common_neighbors:
-                weighted_score = np.mean([
-                    G[u][n]["weight"] * G[v][n]["weight"]
-                    for n in common_neighbors
-                    if G.has_edge(u, n) and G.has_edge(v, n)
-                ])
-            else:
-                weighted_score = 0
-            combined_score = (score + weighted_score) / 2
-            adjusted_preds.append((u, v, combined_score))
+            common = list(nx.common_neighbors(G, u, v))
+            ws = np.mean([G[u][n]["weight"] * G[v][n]["weight"] for n in common if G.has_edge(u, n) and G.has_edge(v, n)]) if common else 0
+            adjusted_preds.append((u, v, (score + ws) / 2))
 
-        # sort & take top_k
         preds_sorted = sorted(adjusted_preds, key=lambda x: x[2], reverse=True)[:top_k]
         candidate_links = []
         for u, v, score in preds_sorted:
-            score_rounded = round(score, 3)
+            s = round(score, 3)
+            emoji, level = ("🟢", "High confidence") if s >= 0.8 else (("🟠", "Medium confidence") if s >= 0.6 else ("🔴", "Low confidence"))
+            candidate_links.append({"source": u, "target": v, "predicted_score": s, "confidence_level": level, "emoji": emoji})
 
-            # Assign color & emoji based on confidence level
-            if score_rounded >= 0.8:
-                emoji = "🟢"
-                level = "High confidence"
-            elif score_rounded >= 0.6:
-                emoji = "🟠"
-                level = "Medium confidence"
-            else:
-                emoji = "🔴"
-                level = "Low confidence"
+        print(f"🔗 {len(candidate_links)} predicted links.")
 
-            candidate_links.append({
-                "source": u,
-                "target": v,
-                "predicted_score": score_rounded,
-                "confidence_level": level,
-                "emoji": emoji
-            })
-
-        print(f"🔗 Found {len(candidate_links)} potential new links.")
-
-        # === 7️⃣ Return Output JSON ===
         return {
             "message": "✅ ESCOPlus classical link prediction completed.",
             "summary": {
-                "Policies processed": len(all_docs),
-                "Mapped ESCO skills": len(ESCO_skill_labels),
-                "Non-ESCO skills": len(non_ESCO_skills),
-                "Observed edges": len(G.edges()),
-                "Predicted new links": len(candidate_links),
-                "Method used": method
+                "Policies processed": len(all_docs), "Mapped ESCO skills": len(ESCO_skill_labels),
+                "Non-ESCO skill pool (CSV+AI+Green)": len(non_ESCO_skills), "Observed edges": len(G.edges()),
+                "Predicted new links": len(candidate_links), "Method used": method
             },
             "predicted_links": candidate_links
         }
-
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
-# === Register routers with main app ===
+
+# ============================================================
+#  REGISTER ROUTERS
+# ============================================================
 app.include_router(analysis_router)
 app.include_router(forecast_router)
