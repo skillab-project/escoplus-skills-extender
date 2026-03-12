@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Optional
 import json, math, re, time, os, requests
 import numpy as np
+import datetime
 
 
 class _NumpyEncoder(json.JSONEncoder):
@@ -76,6 +77,52 @@ forecast_router = APIRouter(prefix="/api/forecasting", tags=["Forecasting"])
 # ============================================================
 #  SHARED HELPERS
 # ============================================================
+
+def _get_analysis_state(file_path: Path):
+    """
+    Checks if analysis is completed, in progress, or available.
+    Returns: (state_string, data_to_return)
+    States: 'completed', 'busy', 'available'
+    """
+    if file_path.exists():
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                cached_data = json.loads(f.read())
+            
+            # Case 1: Finished
+            if cached_data.get("status") == "completed":
+                return "completed", cached_data.get("result")
+
+            # Case 2: Running
+            if cached_data.get("status") == "in_progress":
+                started_at = datetime.datetime.fromisoformat(cached_data.get("started_at"))
+                elapsed = (datetime.datetime.now() - started_at).total_seconds()
+                
+                # Timeout after 20 minutes (assume crash/restart)
+                if elapsed < 1200: 
+                    return "busy", {
+                        "status": "processing",
+                        "message": f"This analysis is already running (started {int(elapsed // 60)}m ago). Please wait.",
+                        "estimated_completion": "Variable depending on API page count"
+                    }
+                else:
+                    print(f"⚠️ Stale analysis detected (>20m). Overwriting...")
+        except Exception as e:
+            print(f"⚠️ Error reading status file: {e}")
+            
+    return "available", None
+
+def _set_analysis_state(file_path: Path, status: str, result: dict = None):
+    """Writes the current state to the JSON file."""
+    data = {
+        "status": status,
+        "started_at": datetime.datetime.now().isoformat() if status == "in_progress" else None,
+        "completed_at": datetime.datetime.now().isoformat() if status == "completed" else None,
+        "result": result
+    }
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(_safe_json_dumps(_sanitize(data)))
+
 
 def _get_token() -> str:
     """Authenticate and return a fresh Bearer token. Reads all values from .env."""
@@ -670,14 +717,17 @@ def jobs_extend_esco_ultra(
         file_path = folder / filename
         print(f"🗂️  Cache path: {file_path}")
 
-        if file_path.exists():
-            print(f"✅ Cache hit — loading from '{file_path}' (skipping all API calls).")
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    return json.loads(f.read())
-            except (json.JSONDecodeError, ValueError) as cache_err:
-                print(f"⚠️  Cache file corrupted ({cache_err}) — deleting and re-running...")
-                file_path.unlink()
+        # --- 1. Check Status ---
+        state, data = _get_analysis_state(file_path)
+        if state == "completed":
+            print(f"✅ Cache hit — returning results.")
+            return data
+        if state == "busy":
+            return data
+
+        # --- 2. Create Lock ---
+        print(f"🌐 Starting new analysis. Locking {file_path}")
+        _set_analysis_state(file_path, "in_progress")
 
         # ================================================================
         # 1️⃣  AUTHENTICATE
@@ -831,14 +881,13 @@ def jobs_extend_esco_ultra(
         # ================================================================
         # 💾  CACHE
         # ================================================================
-        result = _sanitize(result)
-        print(f"💾 Saving to cache: '{file_path}'...")
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(_safe_json_dumps(result))
-        print(f"✅ Cached successfully.")
+        _set_analysis_state(file_path, "completed", result)
+        print(f"✅ Analysis finished and saved to cache.")
         return result
 
     except Exception as e:
+        if file_path.exists():
+            file_path.unlink()
         traceback.print_exc()
         return {"error": str(e)}
 
@@ -1064,15 +1113,16 @@ def jobs_link_prediction(
 
         file_path = folder / filename
         print(f"🗂️ Cache path: {file_path}")
-        if file_path.exists():
-            print(f"✅ Cache hit — loading from '{file_path}'.")
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    cached = json.loads(f.read())
-                return cached
-            except (json.JSONDecodeError, ValueError) as cache_err:
-                print(f"⚠️ Cache file is corrupted ({cache_err}) — deleting and re-running...")
-                file_path.unlink()
+        
+        # --- 1. Check Status ---
+        state, data = _get_analysis_state(file_path)
+        if state == "completed":
+            return data
+        if state == "busy":
+            return data
+
+        # --- 2. Create Lock ---
+        _set_analysis_state(file_path, "in_progress")
 
         print("🌐 No cache — running full analysis...")
         print("🔐 Authenticating...")
@@ -1173,14 +1223,11 @@ def jobs_link_prediction(
             "predicted_links": candidate_links
         }
 
-        result = _sanitize(result)
-        print(f"💾 Saving to cache: '{file_path}'...")
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(_safe_json_dumps(result))
-        print(f"✅ Cached.")
+        _set_analysis_state(file_path, "completed", result)
         return result
-
     except Exception as e:
+        if file_path.exists():
+            file_path.unlink()
         traceback.print_exc()
         return {"error": str(e)}
 
