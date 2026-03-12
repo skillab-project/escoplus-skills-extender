@@ -67,8 +67,9 @@ print(f"   TRACKER_USERNAME = {os.getenv('TRACKER_USERNAME')}")
 print(f"   TRACKER_PASSWORD = {'*' * len(os.getenv('TRACKER_PASSWORD', ''))}")
 print(f"   KU_API_URL   = {os.getenv('KU_API_URL')}")
 
-app = FastAPI(title="SKILLAB ESCOPlus Skills Extender API")
-
+app = FastAPI(title="SKILLAB ESCOPlus Skills Extender API",
+              root_path="/escoplus-skills-extender")
+              
 analysis_router = APIRouter(prefix="/api/analysis", tags=["Analysis"])
 forecast_router = APIRouter(prefix="/api/forecasting", tags=["Forecasting"])
 
