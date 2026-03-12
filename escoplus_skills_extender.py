@@ -53,7 +53,7 @@ import traceback
 # ============================================================
 load_dotenv()
 
-_REQUIRED_ENV = ["TRACKER_API", "TRACKER_USERNAME", "TRACKER_PASSWORD", "KU_API_URL"]
+_REQUIRED_ENV = ["TRACKER_API", "TRACKER_USERNAME", "TRACKER_PASSWORD"]
 _missing = [k for k in _REQUIRED_ENV if not os.getenv(k)]
 if _missing:
     raise RuntimeError(
@@ -65,11 +65,10 @@ print("✅ Environment loaded:")
 print(f"   TRACKER_API  = {os.getenv('TRACKER_API')}")
 print(f"   TRACKER_USERNAME = {os.getenv('TRACKER_USERNAME')}")
 print(f"   TRACKER_PASSWORD = {'*' * len(os.getenv('TRACKER_PASSWORD', ''))}")
-print(f"   KU_API_URL   = {os.getenv('KU_API_URL')}")
 
 app = FastAPI(title="SKILLAB ESCOPlus Skills Extender API",
               root_path="/escoplus-skills-extender")
-              
+
 analysis_router = APIRouter(prefix="/api/analysis", tags=["Analysis"])
 forecast_router = APIRouter(prefix="/api/forecasting", tags=["Forecasting"])
 
@@ -1020,137 +1019,6 @@ def profiles_link_prediction(
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
-
-
-# ============================================================
-#  FORECASTING: /ku-link-prediction  (unchanged logic)
-# ============================================================
-
-@forecast_router.get("/ku-link-prediction")
-def ku_link_prediction(
-    start_date: str = Query(None),
-    end_date: str = Query(None),
-    kus: str = Query(None),
-    organization: str = Query(None),
-    max_edges: int = Query(100),
-    max_nodes: int = Query(200),
-    top_k: int = Query(30),
-    method: str = Query("adamic_adar")
-):
-    try:
-        BASE_URL = os.getenv("KU_API_URL", "").rstrip("/")
-        api_url = f"{BASE_URL}/analysis_results"
-        params = {k: v for k, v in [("start_date", start_date), ("end_date", end_date), ("organization", organization)] if v}
-
-        print(f"🔍 Fetching KU data from {api_url} with {params}")
-        response = requests.get(api_url, params=params, timeout=90)
-        response.raise_for_status()
-        ku_data = response.json()
-
-        if not ku_data:
-            return {"error": "No KU data found."}
-        print(f"✅ Retrieved {len(ku_data)} KU records.")
-
-        selected_kus = set(kus.split(",")) if kus else None
-        ku_docs = []
-        for record in ku_data:
-            detected_kus = record.get("detected_kus", {})
-            org = record.get("organization", "Unknown")
-            timestamp = record.get("timestamp", "")
-            if organization and org.lower() != organization.lower():
-                continue
-            active_kus = [ku for ku, val in detected_kus.items() if str(val) == "1"]
-            if selected_kus:
-                active_kus = [ku for ku in active_kus if ku in selected_kus]
-            if active_kus:
-                ku_docs.append({"organization": org, "timestamp": timestamp, "kus": active_kus})
-
-        print(f"📊 Documents with active KUs: {len(ku_docs)}")
-        if not ku_docs:
-            return {"message": "No KU detections found."}
-
-        co_counts = defaultdict(int)
-        ku_counts = defaultdict(int)
-        for doc in ku_docs:
-            for ku in set(doc["kus"]):
-                ku_counts[ku] += 1
-            for ku1, ku2 in combinations(sorted(set(doc["kus"])), 2):
-                co_counts[(ku1, ku2)] += 1
-
-        print("\n📈 Top 20 KUs:")
-        for ku, count in sorted(ku_counts.items(), key=lambda x: x[1], reverse=True)[:20]:
-            print(f"   {ku}: {count}")
-
-        edges = []
-        for (ku1, ku2), cij in co_counts.items():
-            ci, cj = ku_counts[ku1], ku_counts[ku2]
-            if ci > 0 and cj > 0:
-                edges.append({"source": ku1, "target": ku2, "value": round((cij**2) / (ci * cj), 4), "raw_count": cij})
-
-        if not edges:
-            return {"message": "No co-occurrence edges found."}
-        edges = sorted(edges, key=lambda x: x["value"], reverse=True)[:max_edges]
-
-        G = nx.Graph()
-        for e in edges:
-            G.add_edge(e["source"], e["target"], weight=e["value"])
-        if G.number_of_nodes() > max_nodes:
-            top_nodes = sorted(G.degree, key=lambda x: x[1], reverse=True)[:max_nodes]
-            G = G.subgraph({n for n, _ in top_nodes}).copy()
-
-        if G.number_of_nodes() == 0:
-            return {"message": "No network could be built."}
-
-        density = nx.density(G)
-        avg_deg = float(np.mean([d for _, d in G.degree()]))
-        print(f"\n🧮 Network → Nodes: {G.number_of_nodes()}, Edges: {G.number_of_edges()}, Density: {density:.6f}")
-
-        GC = max(nx.connected_components(G), key=len)
-        subG = G.subgraph(GC).copy()
-        print(f"🕸️ Giant Component: {len(subG.nodes())} nodes, {len(subG.edges())} edges")
-
-        if density < 0.001 and method in ["adamic_adar", "resource_allocation", "jaccard"]:
-            print("⚠️ Sparse graph — switching to preferential_attachment")
-            method = "preferential_attachment"
-
-        if method == "adamic_adar":
-            preds = nx.adamic_adar_index(subG)
-        elif method == "resource_allocation":
-            preds = nx.resource_allocation_index(subG)
-        elif method == "jaccard":
-            preds = nx.jaccard_coefficient(subG)
-        else:
-            preds = nx.preferential_attachment(subG)
-
-        preds_sorted = sorted(preds, key=lambda x: x[2], reverse=True)[:top_k]
-        candidate_links = []
-        for u, v, score in preds_sorted:
-            common = list(nx.common_neighbors(subG, u, v))
-            ws = np.mean([subG[u][n]["weight"] * subG[v][n]["weight"] for n in common]) if common else 0
-            combined = round((score + ws) / 2, 3)
-            emoji, level = ("🟢", "High confidence") if combined >= 0.8 else (("🟡", "Medium confidence") if combined >= 0.6 else ("🔴", "Low confidence"))
-            candidate_links.append({"source": u, "target": v, "predicted_score": combined, "confidence_level": level, "emoji": emoji})
-
-        summary_counts = {
-            "high": sum(1 for c in candidate_links if c["predicted_score"] >= 0.8),
-            "medium": sum(1 for c in candidate_links if 0.6 <= c["predicted_score"] < 0.8),
-            "low": sum(1 for c in candidate_links if c["predicted_score"] < 0.6)
-        }
-
-        return {
-            "message": "✅ KU link prediction completed.",
-            "summary": {
-                "Total KU Records": len(ku_data), "Documents with KUs": len(ku_docs),
-                "Unique KUs": len(ku_counts), "Observed Edges": len(subG.edges()),
-                "Predicted New Links": len(candidate_links), "Density": round(density, 6),
-                "Average Degree": round(avg_deg, 3), "Method Used": method,
-                "Confidence Distribution": summary_counts
-            },
-            "predicted_links": candidate_links
-        }
-    except Exception as e:
-        traceback.print_exc()
-        return {"error": f"KU link prediction failed: {str(e)}"}
 
 
 # ============================================================
