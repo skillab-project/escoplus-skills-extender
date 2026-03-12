@@ -6,6 +6,8 @@ services:
     container_name: escoplus-skills-extender
     environment:
       - TRACKER_API=https://skillab-tracker.csd.auth.gr/api
+      - KU_API_URL=https://se.uom.gr/skillab-public-ku-detection
+    restart: unless-stopped
     ports:
       - '8004:8000'
     labels:

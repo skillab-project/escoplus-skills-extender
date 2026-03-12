@@ -2,7 +2,7 @@ import pytest
 import os
 from fastapi.testclient import TestClient
 from dotenv import load_dotenv
-
+from pathlib import Path 
 from escoplus_skills_extender import app
 
 load_dotenv()
@@ -10,6 +10,19 @@ load_dotenv()
 client = TestClient(app)
 
 CREDENTIALS_PRESENT = os.getenv("TRACKER_USERNAME") and os.getenv("TRACKER_PASSWORD")
+
+@pytest.fixture(autouse=True)
+def cleanup_completed_analyses():
+    """Delete any cache files created under Completed_Analyses/ during each test."""
+    folder = Path("Completed_Analyses")
+    files_before = set(folder.glob("*.json")) if folder.exists() else set()
+ 
+    yield
+ 
+    if folder.exists():
+        files_after = set(folder.glob("*.json"))
+        for new_file in files_after - files_before:
+            new_file.unlink()
 
 @pytest.fixture(scope="class", autouse=True)
 def cleanup_generated_csvs():
@@ -89,8 +102,7 @@ class TestESCOPlusIntegration:
         response = client.get(
             "/api/analysis/jobs_ultra",
             params={
-                "keywords": "developer",
-                "max_pages": 1,
+                "occupation_ids": "http://data.europa.eu/esco/isco/C3133",
                 "similarity_threshold": 0.8
             }
         )

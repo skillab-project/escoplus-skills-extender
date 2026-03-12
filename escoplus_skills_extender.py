@@ -850,7 +850,7 @@ def jobs_extend_esco_ultra(
 @analysis_router.get("/courses_ultra")
 def courses_extend_esco(
     keywords: str = Query(...),
-    source: str = Query("coursera"),
+    source: str = Query(None, description="Optional source filter (e.g. Udacity, europass)"),
     similarity_threshold: float = Query(0.8),
     confidence_threshold: float = Query(0.6)
 ):
