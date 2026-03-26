@@ -109,12 +109,15 @@ def test_profiles_link_prediction(mock_post, mock_csv):
 
 def test_jobs_ultra_error_handling():
     """Test how the API handles a failed tracker authentication."""
+    # Clean up any stale lock files from previous runs
+    cache_file = Path("Completed_Analyses/completed_analysis_jobs_ultra_esco_test_sim0.8_conf0.6.json")
+    cache_file.unlink(missing_ok=True)
+
     with patch("requests.post") as mock_post:
         mock_res = MagicMock()
         mock_res.status_code = 401
         mock_post.return_value = mock_res
-        
+
         response = client.get("/api/analysis/jobs_ultra?keywords=test")
-        # App logic catches exception and returns error key
         assert response.status_code == 200
         assert "error" in response.json()
