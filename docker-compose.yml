@@ -6,8 +6,15 @@ services:
     container_name: escoplus-skills-extender
     environment:
       - TRACKER_API=https://skillab-tracker.csd.auth.gr/api
+    volumes:
+      - escoplus-skills-extender_analyses:/app/Completed_Analyses
     restart: unless-stopped
     ports:
       - '8004:8000'
+    labels:
+      io.portainer.accesscontrol.teams: skillab-all
+
+volumes:
+  escoplus-skills-extender_analyses:
     labels:
       io.portainer.accesscontrol.teams: skillab-all

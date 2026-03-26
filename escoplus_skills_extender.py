@@ -599,6 +599,27 @@ def profiles_extend_esco(
     confidence_threshold: float = Query(0.6),
     max_pages: int = Query(10)
 ):
+    # Build cache filename
+    folder = _ensure_cache_folder()
+    keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
+    filename = "completed_analysis_profiles_esco"
+    for kw in keywords_list:
+        filename += f"_{kw}"
+    if source:
+        filename += f"_{source}"
+    filename += f"_sim{similarity_threshold}_conf{confidence_threshold}.json"
+    file_path = folder / filename
+
+    # Check cache
+    state, data = _get_analysis_state(file_path)
+    if state == "completed":
+        return data
+    if state == "busy":
+        return data
+
+    # Lock
+    _set_analysis_state(file_path, "in_progress")
+
     try:
         print("🔐 Authenticating...")
         token = _get_token()
@@ -649,7 +670,7 @@ def profiles_extend_esco(
         output_path = "ESCOplus_Extended_from_Profiles.csv"
         pd.DataFrame(high_conf).to_csv(output_path, index=False)
 
-        return {
+        result = {
             "message": "✅ ESCOPlus taxonomy extended from profiles.",
             "summary": {
                 "Profiles processed": len(all_profiles),
@@ -664,7 +685,13 @@ def profiles_extend_esco(
             "output_file": output_path,
             "network": {"nodes": nodes, "edges": edges, "stats": net_stats}
         }
+
+        #Save on completion
+        _set_analysis_state(file_path, "completed", result)
+        return result
     except Exception as e:
+        if file_path.exists():
+            file_path.unlink()
         traceback.print_exc()
         return {"error": str(e)}
 
@@ -982,6 +1009,27 @@ def profiles_link_prediction(
     top_k: int = Query(30),
     method: str = Query("adamic_adar")
 ):
+    # Build cache filename
+    folder = _ensure_cache_folder()
+    keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
+    filename = "completed_analysis_forecast_profiles_esco"
+    for kw in keywords_list:
+        filename += f"_{kw}"
+    if source:
+        filename += f"_{source}"
+    filename += f"_sim{similarity_threshold}_conf{confidence_threshold}.json"
+    file_path = folder / filename
+
+    # Check cache
+    state, data = _get_analysis_state(file_path)
+    if state == "completed":
+        return data
+    if state == "busy":
+        return data
+
+    # Lock
+    _set_analysis_state(file_path, "in_progress")
+
     try:
         print("🔐 Authenticating...")
         token = _get_token()
@@ -1052,7 +1100,7 @@ def profiles_link_prediction(
             "low": sum(1 for c in candidate_links if c["predicted_score"] < 0.6)
         }
 
-        return {
+        result = {
             "message": "✅ ESCOPlus classical link prediction completed.",
             "summary": {
                 "Profiles processed": len(all_profiles),
@@ -1065,7 +1113,13 @@ def profiles_link_prediction(
             },
             "predicted_links": candidate_links
         }
+        
+        #Save on completion
+        _set_analysis_state(file_path, "completed", result)
+        return result
     except Exception as e:
+        if file_path.exists():
+            file_path.unlink()
         traceback.print_exc()
         return {"error": str(e)}
 
