@@ -1017,7 +1017,7 @@ def profiles_link_prediction(
         filename += f"_{kw}"
     if source:
         filename += f"_{source}"
-    filename += f"_sim{similarity_threshold}_conf{confidence_threshold}.json"
+    filename += f"_sim{similarity_threshold}_conf{top_k}.json"
     file_path = folder / filename
 
     # Check cache
