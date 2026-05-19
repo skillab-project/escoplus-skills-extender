@@ -1304,11 +1304,28 @@ def courses_link_prediction(
         headers = {"Authorization": f"Bearer {token}"}
 
         keywords_list = [k.strip() for k in keywords.split(",") if k.strip()]
-        payload = {"keywords": keywords_list, "keywords_logic": "or", "sources": [source]}
         all_courses = []
         for page in range(1, 51):
+            # Use a list of tuples for Form Data instead of a Dictionary
+            form_data = [
+                ("keywords_logic", "or"), 
+                ("skill_ids_logic", "or")
+            ]
+            
+            # Append each keyword individually (crucial for Form Data)
+            for kw in keywords_list:
+                form_data.append(("keywords", kw))
+                
+            # Handle source correctly
+            if source:
+                form_data.append(("sources", source))
             url = f"{os.getenv('TRACKER_API')}/courses?page={page}&page_size=100"
-            res = requests.post(url, headers=headers, data=payload, timeout=60)
+            request_headers = {
+                "Authorization": f"Bearer {token}"
+            }
+
+            res = requests.post(url, headers=request_headers, data=form_data, timeout=60)
+
             if res.status_code != 200:
                 break
             items = res.json().get("items", [])
