@@ -159,7 +159,7 @@ def _batch_resolve_skills(headers: dict, unique_uris: list) -> dict:
         batch = unique_uris[start:start + batch_size]
         skill_payload = [("ids", sid) for sid in batch]
         try:
-            r = requests.post(f"{api_url}/skills", headers=headers, data=skill_payload, timeout=60)
+            r = requests.post(f"{api_url}/skills", headers=headers, data=skill_payload, timeout=180)
             r.raise_for_status()
             for s in r.json().get("items", []):
                 sid = s.get("id", "")
@@ -536,7 +536,7 @@ def law_policies_extend_esco(
         all_docs = []
         for page in range(1, 51):
             url = f"{os.getenv('TRACKER_API')}/law-policies?page={page}&page_size=100"
-            res = requests.post(url, headers=headers, data=payload, timeout=60)
+            res = requests.post(url, headers=headers, data=payload, timeout=180)
             if res.status_code != 200:
                 break
             data = res.json()
@@ -638,7 +638,7 @@ def profiles_extend_esco(
             if source:
                 form_data.append(("sources", source))
             url = f"{os.getenv('TRACKER_API')}/profiles?page={page}&page_size=100"
-            res = requests.post(url, headers=headers, data=form_data, timeout=90)
+            res = requests.post(url, headers=headers, data=form_data, timeout=180)
             if res.status_code != 200:
                 break
             items = res.json().get("items", [])
@@ -946,7 +946,7 @@ def courses_extend_esco(
             for kw in keywords_list:
                 form_data.append(("keywords", kw))
             url = f"{os.getenv('TRACKER_API')}/courses?page={page}&page_size=100"
-            res = requests.post(url, headers=headers, data=form_data, timeout=60)
+            res = requests.post(url, headers=headers, data=form_data, timeout=180)
             if res.status_code != 200:
                 break
             items = res.json().get("items", [])
@@ -1043,7 +1043,7 @@ def profiles_link_prediction(
         all_profiles = []
         for page in range(1, 51):
             url = f"{os.getenv('TRACKER_API')}/profiles?page={page}&page_size=100"
-            res = requests.post(url, headers=headers, data=payload, timeout=60)
+            res = requests.post(url, headers=headers, data=payload, timeout=180)
             if res.status_code != 200:
                 break
             items = res.json().get("items", [])
@@ -1324,7 +1324,7 @@ def courses_link_prediction(
                 "Authorization": f"Bearer {token}"
             }
 
-            res = requests.post(url, headers=request_headers, data=form_data, timeout=60)
+            res = requests.post(url, headers=request_headers, data=form_data, timeout=180)
 
             if res.status_code != 200:
                 break
@@ -1419,7 +1419,7 @@ def law_policies_link_prediction(
         all_docs = []
         for page in range(1, 51):
             url = f"{os.getenv('TRACKER_API')}/law-policies?page={page}&page_size=100"
-            res = requests.post(url, headers=headers, data=payload, timeout=60)
+            res = requests.post(url, headers=headers, data=payload, timeout=180)
             if res.status_code != 200:
                 break
             items = res.json().get("items", [])
